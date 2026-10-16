@@ -1,0 +1,22 @@
+version: 2
+
+registries:
+  jsr:
+    type: npm-registry
+    url: https://npm.jsr.io
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 1
+
+  - package-ecosystem: npm
+    directory: /
+    registries: [jsr]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 1
