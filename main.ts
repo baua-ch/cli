@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 /** Kept equal to jsr.json's version (a unit test checks it). */
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.1';
 
 export const DEFAULT_URL = 'https://console.baua.ch';
 
