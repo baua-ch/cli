@@ -8,6 +8,13 @@ BAUA_TOKEN=bdt_… deno run -A jsr:@baua/cli@0 deploy dist --runtime node@24
 
 The CLI uploads the directory, prints the build log and exits with `0` once the app runs.
 
+Install it as a `baua` command:
+
+```sh
+deno install -g -A -n baua jsr:@baua/cli@0
+baua deploy dist --runtime node@24
+```
+
 ## Options
 
 | Option | |
