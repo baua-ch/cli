@@ -1,0 +1,11 @@
+{
+  "name": "baua-cli",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test main.test.ts"
+  },
+  "devDependencies": {
+    "@std/assert": "npm:@jsr/std__assert@1.0.19"
+  }
+}

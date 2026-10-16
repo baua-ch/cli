@@ -1,0 +1,9 @@
+{
+  "name": "@baua/cli",
+  "version": "0.1.0",
+  "license": "MIT",
+  "exports": "./main.ts",
+  "publish": {
+    "include": ["main.ts", "jsr.json", "LICENSE", "README.md"]
+  }
+}
