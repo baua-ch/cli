@@ -1,4 +1,4 @@
-# Publishes @baua/cli to JSR, only when started by hand from main: raise the version in jsr.json and main.ts first.
+# Publishes @baua/cli to JSR, only when started by hand from main: raise the version in jsr.json and main.ts first. Then tags the commit and makes a GitHub release.
 # JSR's OIDC publishing: no token is stored; this repository is linked to the package on jsr.io.
 name: publish
 
@@ -48,3 +48,21 @@ jobs:
           node-version-file: .node-version
 
       - run: npx --yes jsr@0.14.3 publish
+
+  # After JSR, the same commit gets the tag v<version> and a GitHub release, so every published version shows on GitHub too.
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: |
+          version="$(node -p 'require("./jsr.json").version')"
+          gh release create "v$version" --target "$GITHUB_SHA" --title "$version" --generate-notes --notes "Published on JSR as [@baua/cli@$version](https://jsr.io/@baua/cli@$version)."
+        env:
+          GH_TOKEN: ${{ github.token }}
