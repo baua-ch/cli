@@ -35,6 +35,15 @@ BAUA_TOKEN=baua_… baua errors --project acme/shop --since 7d --stack
 
 `logs` prints the app's log lines (the newest 100, or `--since 1h`; `-f` keeps following). `errors` lists the exceptions your app reported through OpenTelemetry, grouped, with a link to the newest trace. Both read production, or a preview with `--preview <name>`, and need an API token (`baua_…`), not a deploy token. All commands: [console.baua.ch/docs/cli](https://console.baua.ch/docs/cli).
 
+## Run locally with the app's variables
+
+```sh
+BAUA_TOKEN=baua_… baua run --project acme/shop -- node main.ts
+BAUA_TOKEN=baua_… baua env pull --project acme/shop --preview pr-1   # writes .env
+```
+
+`run` starts the command after `--` with the app's environment variables, without writing them to disk; its exit code is the CLI's. `env pull` writes them to a new file only you can read (default `.env`, `--force` replaces one). Production, or the previews' values with `--preview <name>`; an API token, not a deploy token.
+
 ## GitHub Actions
 
 ```yaml

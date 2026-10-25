@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * The baua CLI: `baua deploy <dir> --runtime <runtime>` uploads a directory that CI has built and follows the deployment until it runs (https://console.baua.ch/docs/deploy-from-ci);
- * `baua logs` prints an app's log lines and `baua errors` the exceptions it reported through OpenTelemetry (https://console.baua.ch/docs/cli).
+ * `baua logs` prints an app's log lines and `baua errors` the exceptions it reported through OpenTelemetry; `baua env pull` writes an app's
+ * environment variables to a .env file and `baua run` starts a local command with them (https://console.baua.ch/docs/cli).
  * Runs on Node.js 24 and Deno 2 without dependencies; packs with the system `tar`.
  *
  * @module
@@ -9,14 +10,15 @@
 import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { constants } from 'node:os';
 import { join, relative } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 /** Kept equal to jsr.json's version (a unit test checks it). */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 export const DEFAULT_URL = 'https://console.baua.ch';
 
@@ -49,10 +51,14 @@ const USAGE = `Usage:
   baua deploy <dir> --runtime <runtime> [--start <command>] [--preview <name>] [--project <org>/<name>]
   baua logs --project <org>/<name> [--preview <name>] [--since <time>] [--follow]
   baua errors --project <org>/<name> [--preview <name>] [--since <time>] [--stack]
+  baua env pull [<file>] --project <org>/<name> [--preview <name>] [--force]
+  baua run --project <org>/<name> [--preview <name>] -- <command> [<args>…]
 
   deploy   uploads the built app in <dir> to baua and follows the deployment until it runs
   logs     prints the app's log lines
   errors   lists the exceptions the app reported through OpenTelemetry, grouped by type and message
+  env pull writes the app's environment variables to <file> (default .env); --force overwrites it
+  run      starts <command> on this machine with the app's environment variables, without writing them to disk
 
 Options:
   --runtime <runtime>   deploy: ${RUNTIMES.join(', ')}
@@ -62,6 +68,7 @@ Options:
   --since <time>        logs, errors: how far back, e.g. 15m, 1h, 24h, 7d (logs: default the newest ${LOG_LINES} lines; errors: default 24h)
   -f, --follow          logs: keep printing new lines until Ctrl+C
   --stack               errors: print the newest stack trace of each group
+  --force               env pull: overwrite an existing file
   -h, --help            show this help
   -v, --version         show the version
 
@@ -86,12 +93,27 @@ export interface ReadOptions {
   stack: boolean;
 }
 
-export type Command = { kind: 'help' } | { kind: 'version' } | { kind: 'deploy'; options: DeployOptions } | { kind: 'logs' | 'errors'; options: ReadOptions } | { kind: 'error'; message: string };
+/** The options of `baua env pull` (`file`, `force`) and `baua run` (`command`). */
+export interface EnvOptions {
+  project: { org: string; name: string };
+  preview?: string;
+}
+
+export type Command =
+  | { kind: 'help' }
+  | { kind: 'version' }
+  | { kind: 'deploy'; options: DeployOptions }
+  | { kind: 'logs' | 'errors'; options: ReadOptions }
+  | { kind: 'env'; options: EnvOptions & { file: string; force: boolean } }
+  | { kind: 'run'; options: EnvOptions & { command: string[] } }
+  | { kind: 'error'; message: string };
 
 export interface Deps {
   fetch: typeof fetch;
   sleep: (ms: number) => Promise<void>;
   pack: (dir: string) => Promise<Packed>;
+  /** Runs the command with these variables on top of the CLI's own environment; resolves to its exit code. */
+  exec: (command: string[], vars: Record<string, string>) => Promise<number>;
   print: (line: string) => void;
   error: (line: string) => void;
 }
@@ -110,7 +132,7 @@ class UnreachableError extends CliError {}
 const UNAVAILABLE = [502, 503, 504];
 
 /** The options only some commands take. */
-const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'] };
+const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'], force: ['env'] };
 
 /** Parses and checks the arguments locally, before anything is packed or sent. */
 export function parseCommand(args: string[]): Command {
@@ -128,6 +150,7 @@ export function parseCommand(args: string[]): Command {
         since: { type: 'string' },
         follow: { type: 'boolean', short: 'f' },
         stack: { type: 'boolean' },
+        force: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -137,6 +160,13 @@ export function parseCommand(args: string[]): Command {
   }
 
   const { values, positionals } = parsed;
+  // `baua run` takes its command after `--` only: without it, the command's own options (-f, --version) would be read as the CLI's.
+  const dash = args.indexOf('--');
+  const runCommand = dash < 0 ? [] : args.slice(dash + 1);
+  if (positionals[0] === 'run' && !values.help && (runCommand.length === 0 || positionals.length !== runCommand.length + 1)) {
+    return { kind: 'error', message: 'expected: baua run --project <org>/<name> -- <command> [<args>…]' };
+  }
+
   if (values.help) {
     return { kind: 'help' };
   }
@@ -147,8 +177,10 @@ export function parseCommand(args: string[]): Command {
 
   const command = positionals[0];
   const read = (command === 'logs' || command === 'errors') && positionals.length === 1;
-  if (!read && !(command === 'deploy' && positionals.length === 2)) {
-    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs or baua errors (see --help)' };
+  const pull = command === 'env' && positionals[1] === 'pull' && positionals.length <= 3;
+  const runs = command === 'run';
+  if (!read && !pull && !runs && !(command === 'deploy' && positionals.length === 2)) {
+    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs, baua errors, baua env pull or baua run -- <command> (see --help)' };
   }
 
   const wrong = Object.keys(ONLY).find((name) => values[name as keyof typeof values] !== undefined && !ONLY[name].includes(command));
@@ -170,11 +202,19 @@ export function parseCommand(args: string[]): Command {
     project = { org: match[1], name: match[2] };
   }
 
-  if (command === 'logs' || command === 'errors') {
-    if (!project) {
-      return { kind: 'error', message: `--project <org>/<name> is required for baua ${command}` };
-    }
+  if (command !== 'deploy' && !project) {
+    return { kind: 'error', message: `--project <org>/<name> is required for baua ${command}` };
+  }
 
+  if (command === 'env' && project) {
+    return { kind: 'env', options: { project, preview: values.preview, file: positionals[2] ?? '.env', force: values.force === true } };
+  }
+
+  if (command === 'run' && project) {
+    return { kind: 'run', options: { project, preview: values.preview, command: runCommand } };
+  }
+
+  if ((command === 'logs' || command === 'errors') && project) {
     let sinceMs: number | undefined;
     if (values.since !== undefined) {
       const match = /^([1-9][0-9]{0,4})([mhd])$/.exec(values.since);
@@ -402,6 +442,14 @@ export async function run(args: string[], env: Record<string, string | undefined
       throw new CliError(`baua ${command.kind} needs an API token (baua_…) and --project; a deploy token can only deploy`);
     }
 
+    if (command.kind === 'env') {
+      return await pullEnv(deps, base, token, command.options);
+    }
+
+    if (command.kind === 'run') {
+      return await runWithEnv(deps, base, token, command.options);
+    }
+
     return command.kind === 'logs' ? await printLogs(deps, base, token, command.options) : await printErrors(deps, base, token, command.options);
   } catch (error) {
     if (error instanceof CliError) {
@@ -574,6 +622,135 @@ async function printErrors(deps: Deps, base: string, token: string, options: Rea
   return 0;
 }
 
+interface EnvVariable {
+  name: string;
+  scope: 'production' | 'preview' | 'both';
+  value: string | null;
+}
+
+/**
+ * The variables production or a preview gets, as baua passes them to its container: the scope's own values and those for both, a
+ * scope's own value before one for both. baua's own variables (OTEL_*, DATABASE_URL, DENO_KV_*) are set at the start of the container
+ * and point inside baua; they are not in the list.
+ */
+export function scopeValues(variables: EnvVariable[], preview: boolean): Record<string, string> {
+  const scope = preview ? 'preview' : 'production';
+  const env: Record<string, string> = {};
+  // 'both' first, so a scope's own value replaces it.
+  const ordered = [...variables.filter((v) => v.scope === 'both'), ...variables.filter((v) => v.scope === scope)];
+
+  for (const variable of ordered) {
+    if (variable.value === null) {
+      throw new CliError(`variable ${variable.name} cannot be decrypted – set it again in the console`);
+    }
+
+    env[variable.name] = variable.value;
+  }
+
+  return env;
+}
+
+/**
+ * A .env file: one `NAME='value'` line per variable. Single quotes are read literally (Node.js `--env-file`, dotenv), line breaks stay
+ * inside them. Refused, rather than read back changed: a `'`, a carriage return (the parsers turn CRLF into LF) or a trailing backslash
+ * (it would escape the closing quote).
+ */
+export function dotenv(env: Record<string, string>, header: string): string {
+  const lines = [`# ${header}`];
+
+  for (const [name, value] of Object.entries(env)) {
+    if (value.includes("'") || value.includes('\r') || value.endsWith('\\')) {
+      throw new CliError(`the value of ${name} cannot be written to a .env file unchanged (a ', a carriage return or a trailing backslash); use baua run instead`);
+    }
+
+    lines.push(`${name}='${value}'`);
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+async function fetchEnv(deps: Deps, base: string, token: string, options: EnvOptions): Promise<Record<string, string>> {
+  const { variables } = await getJson<{ variables: EnvVariable[] }>(deps, `${projectApi(base, options.project)}/env`, token);
+
+  return scopeValues(variables, options.preview !== undefined);
+}
+
+/** Every preview has the same values, so the preview's name is not checked and not named. */
+function target(options: EnvOptions): string {
+  return `${options.project.org}/${options.project.name} (${options.preview ? 'previews' : 'production'})`;
+}
+
+/** `baua env pull`: the variables into a new file only its owner can read; with --force an existing one is replaced, not reused with its mode. */
+async function pullEnv(deps: Deps, base: string, token: string, options: EnvOptions & { file: string; force: boolean }): Promise<number> {
+  const env = await fetchEnv(deps, base, token, options);
+  const text = dotenv(env, `baua env pull: ${target(options)}, ${new Date().toISOString()}. Secrets – keep this file out of Git.`);
+
+  try {
+    if (options.force) {
+      await rm(options.file, { force: true });
+    }
+
+    await writeFile(options.file, text, { mode: 0o600, flag: 'wx' });
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    throw new CliError(code === 'EEXIST' ? `${options.file} exists; --force overwrites it` : `cannot write ${options.file}: ${(error as Error).message}`);
+  }
+
+  const count = Object.keys(env).length;
+  deps.print(`==> ${count} ${count === 1 ? 'variable' : 'variables'} of ${target(options)} written to ${options.file}; keep it out of Git`);
+
+  return 0;
+}
+
+/** `baua run`: the command's exit code; the CLI's messages go to stderr, so the command's stdout stays its own. */
+async function runWithEnv(deps: Deps, base: string, token: string, options: EnvOptions & { command: string[] }): Promise<number> {
+  const env = await fetchEnv(deps, base, token, options);
+  const count = Object.keys(env).length;
+  deps.error(`==> ${options.command[0]} with ${count} ${count === 1 ? 'variable' : 'variables'} of ${target(options)}`);
+
+  return await deps.exec(options.command, env);
+}
+
+/** Runs the command without a shell, its output on this terminal; the variables replace those of the same name in the CLI's environment. */
+export function exec(command: string[], vars: Record<string, string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      // ponytail: no shell, so npm, npx and other .cmd scripts on Windows need `cmd /c` in front; a shell would re-read the arguments.
+      child = spawn(command[0], command.slice(1), { stdio: 'inherit', env: { ...process.env, ...vars } });
+    } catch (error) {
+      reject(new CliError(`cannot run ${command[0]}: ${(error as Error).message}`));
+
+      return;
+    }
+
+    // Ctrl+C reaches the command from the terminal itself: the CLI waits for its exit code instead of ending first. A SIGTERM or SIGHUP
+    // reaches only the CLI: it is passed on, so the command does not run on alone.
+    const ignore = () => {};
+    const pass = (signal: NodeJS.Signals) => child.kill(signal);
+    const handlers = [['SIGINT', ignore], ['SIGTERM', pass], ['SIGHUP', pass]] as const;
+    for (const [signal, handler] of handlers) {
+      process.on(signal, handler);
+    }
+
+    const done = () => {
+      for (const [signal, handler] of handlers) {
+        process.off(signal, handler);
+      }
+    };
+
+    child.on('error', (error) => {
+      done();
+      reject(new CliError(`cannot run ${command[0]}: ${error.message}`));
+    });
+    child.on('close', (code, signal) => {
+      done();
+      // Ended by a signal: 128 + its number, as a shell reports it (130 for Ctrl+C).
+      resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1));
+    });
+  });
+}
+
 /** Packs the directory's contents with the system tar (flags GNU tar and bsdtar share); refuses symlinks, which baua refuses too. */
 export async function pack(dir: string): Promise<Packed> {
   const info = await stat(dir).catch(() => null);
@@ -631,6 +808,7 @@ if (import.meta.main ?? (process.argv[1] !== undefined && realpathSync(process.a
     fetch: globalThis.fetch,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     pack,
+    exec,
     print: (line) => console.log(line),
     error: (line) => console.error(line),
   };
