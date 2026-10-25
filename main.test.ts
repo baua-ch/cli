@@ -1,10 +1,10 @@
 import { test } from 'node:test';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { assertEquals, assertMatch, assertRejects, assertStringIncludes, assertThrows } from '@std/assert';
-import { clean, consoleUrl, type Deps, deploymentPage, ERRORS_SINCE_MS, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
+import { clean, consoleUrl, type Deps, deploymentPage, dotenv, ERRORS_SINCE_MS, exec, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, scopeValues, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
 
 const BASE = 'https://console.example';
 
@@ -15,6 +15,7 @@ function fakeDeps(routes: Record<string, Route | Route[]>, maxSleeps = Infinity)
   const printed: string[] = [];
   const errors: string[] = [];
   const requests: { method: string; url: string; headers: Record<string, string> }[] = [];
+  const executed: { command: string[]; vars: Record<string, string> }[] = [];
   const calls = new Map<string, number>();
   let slept = 0;
   const deps: Deps = {
@@ -42,11 +43,16 @@ function fakeDeps(routes: Record<string, Route | Route[]>, maxSleeps = Infinity)
       }
     },
     pack: async () => ({ body: new Uint8Array([1, 2, 3]), files: 3 }),
+    exec: async (command, vars) => {
+      executed.push({ command, vars });
+
+      return 7;
+    },
     print: (line) => printed.push(line),
     error: (line) => errors.push(line),
   };
 
-  return { deps, printed, errors, requests, slept: () => slept };
+  return { deps, printed, errors, requests, executed, slept: () => slept };
 }
 
 const json =
@@ -421,4 +427,93 @@ test('run errors: nothing found', async () => {
 
   assertEquals(await run(['errors', '--project', 'acme/shop', '--preview', 'pr-1', '--since', '15m'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 0);
   assertMatch(fake.printed[0], /^no errors since \d{4}-\d{2}-\d{2}T/);
+});
+
+test('parseCommand: env pull and run', () => {
+  const project = { org: 'acme', name: 'shop' };
+  assertEquals(parseCommand(['env', 'pull', '--project', 'acme/shop']), { kind: 'env', options: { project, preview: undefined, file: '.env', force: false } });
+  assertEquals(parseCommand(['env', 'pull', '.env.local', '--project', 'acme/shop', '--preview', 'pr-1', '--force']), { kind: 'env', options: { project, preview: 'pr-1', file: '.env.local', force: true } });
+  assertEquals(parseCommand(['run', '--project', 'acme/shop', '--', 'node', '--watch', 'main.ts']), { kind: 'run', options: { project, preview: undefined, command: ['node', '--watch', 'main.ts'] } });
+
+  assertEquals(parseCommand(['env', 'pull']), { kind: 'error', message: '--project <org>/<name> is required for baua env' });
+  assertEquals(parseCommand(['run', '--project', 'acme/shop']).kind, 'error');
+  // Without `--` the command's own options would be read as the CLI's.
+  const noDash = { kind: 'error', message: 'expected: baua run --project <org>/<name> -- <command> [<args>…]' };
+  assertEquals(parseCommand(['run', '--project', 'acme/shop', 'node', 'main.ts']), noDash);
+  assertEquals(parseCommand(['run', '--project', 'acme/shop', 'node', '--version']), noDash);
+  assertEquals(parseCommand(['run', 'foo', '--project', 'acme/shop', '--', 'node']), noDash);
+  assertEquals(parseCommand(['env', 'push', '--project', 'acme/shop']).kind, 'error');
+  assertEquals(parseCommand(['run', '--force', '--project', 'acme/shop', '--', 'node']), { kind: 'error', message: '--force is not an option of baua run' });
+});
+
+test('scopeValues: a scope gets its own values and those for both, its own first', () => {
+  const variables = [
+    { name: 'API_URL', scope: 'production' as const, value: 'https://api' },
+    { name: 'API_URL', scope: 'preview' as const, value: 'https://staging' },
+    { name: 'GREETING', scope: 'both' as const, value: 'hi' },
+    { name: 'DEBUG', scope: 'preview' as const, value: '1' },
+  ];
+
+  assertEquals(scopeValues(variables, false), { GREETING: 'hi', API_URL: 'https://api' });
+  assertEquals(scopeValues(variables, true), { GREETING: 'hi', API_URL: 'https://staging', DEBUG: '1' });
+  assertEquals(scopeValues([{ name: 'X', scope: 'both', value: 'both' }, { name: 'X', scope: 'production', value: 'own' }], false), { X: 'own' });
+  assertThrows(() => scopeValues([{ name: 'KEY', scope: 'both', value: null }], false), Error, 'variable KEY cannot be decrypted');
+});
+
+test('dotenv: single quotes, line breaks inside them; what would be read back changed is refused', () => {
+  assertEquals(dotenv({ A: 'plain', B: 'say "hi" `now` $HOME', C: 'two\nlines # not a comment', D: 'C:\\new\\dir' }, 'head'), "# head\nA='plain'\nB='say \"hi\" `now` $HOME'\nC='two\nlines # not a comment'\nD='C:\\new\\dir'\n");
+  for (const value of ["it's", 'crlf\r\nline', 'C:\\dir\\']) {
+    assertThrows(() => dotenv({ K: value }, 'h'), Error, 'the value of K cannot be written to a .env file unchanged');
+  }
+});
+
+test('run env pull: writes the production values to a file, an existing one only with --force', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'baua-env-'));
+  const file = join(dir, '.env');
+  const fake = fakeDeps({
+    'GET /api/orgs/acme/projects/shop/env': json({ variables: [{ name: 'KEY', scope: 'both', value: 's3cret', readable: true }, { name: 'ONLY_PREVIEW', scope: 'preview', value: 'x', readable: true }] }),
+  });
+  const env = { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE };
+
+  try {
+    assertEquals(await run(['env', 'pull', file, '--project', 'acme/shop'], env, fake.deps), 0);
+    assertMatch(await readFile(file, 'utf8'), /^# baua env pull: acme\/shop \(production\), .*\nKEY='s3cret'\n$/);
+    assertEquals(fake.requests[0].headers, { authorization: 'Bearer baua_x' });
+    assertEquals(fake.printed, [`==> 1 variable of acme/shop (production) written to ${file}; keep it out of Git`]);
+
+    assertEquals(await run(['env', 'pull', file, '--project', 'acme/shop', '--preview', 'pr-1'], env, fake.deps), 1);
+    assertEquals(fake.errors, [`error: ${file} exists; --force overwrites it`]);
+
+    // --force replaces the file: a new one only its owner can read, not the old one with its mode.
+    await chmod(file, 0o644);
+    assertEquals(await run(['env', 'pull', file, '--project', 'acme/shop', '--preview', 'pr-1', '--force'], env, fake.deps), 0);
+    assertStringIncludes(await readFile(file, 'utf8'), "# baua env pull: acme/shop (previews)");
+    assertStringIncludes(await readFile(file, 'utf8'), "ONLY_PREVIEW='x'");
+    if (process.platform !== 'win32') {
+      assertEquals((await stat(file)).mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(dir, { recursive: true });
+  }
+});
+
+test('run run: the command gets the values and its exit code is the CLI\'s; a deploy token is refused', async () => {
+  const fake = fakeDeps({ 'GET /api/orgs/acme/projects/shop/env': json({ variables: [{ name: 'KEY', scope: 'production', value: 's3cret', readable: true }] }) });
+
+  assertEquals(await run(['run', '--project', 'acme/shop', '--', 'node', 'main.ts'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 7);
+  assertEquals(fake.executed, [{ command: ['node', 'main.ts'], vars: { KEY: 's3cret' } }]);
+  assertEquals(fake.printed, []);
+  assertEquals(fake.errors, ['==> node with 1 variable of acme/shop (production)']);
+
+  assertEquals(await run(['run', '--project', 'acme/shop', '--', 'node'], { BAUA_TOKEN: 'bdt_x', BAUA_URL: BASE }, fake.deps), 1);
+  assertStringIncludes(fake.errors.at(-1)!, 'baua run needs an API token');
+  assertEquals(fake.executed.length, 1);
+});
+
+test('exec: the variables reach the command, its exit code comes back', async () => {
+  const code = await exec([process.execPath, '-e', 'process.exit(process.env.BAUA_TEST_VAR === "y" ? 3 : 4)'], { BAUA_TEST_VAR: 'y' });
+  assertEquals(code, 3);
+  assertEquals(await exec([process.execPath, '-e', 'process.kill(process.pid, "SIGTERM")'], {}), process.platform === 'win32' ? 1 : 143);
+  await assertRejects(() => exec(['baua-no-such-command'], {}), Error, 'cannot run baua-no-such-command');
+  await assertRejects(() => exec([''], {}), Error, 'cannot run');
 });
