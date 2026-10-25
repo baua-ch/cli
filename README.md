@@ -54,6 +54,6 @@ node ~/.baua/node_modules/@jsr/baua__cli/main.js deploy dist --runtime node@24
 
 ## Development
 
-`npm install && npm test`. To release, raise the version in `jsr.json` and `main.ts`, then run the **publish** workflow: it publishes to JSR, tags the commit `v<version>` and makes a GitHub release.
+`npm install && npm test`. To release, raise the version in `jsr.json` and `main.ts`, merge, then tag main `v<version>` (with `git tag` and `git push --tags`, or as a release on GitHub): the **publish** workflow tests, publishes to JSR and makes the release if there is none.
 
 MIT
