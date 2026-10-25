@@ -4,14 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { assertEquals, assertMatch, assertRejects, assertStringIncludes, assertThrows } from '@std/assert';
-import { consoleUrl, type Deps, deploymentPage, newLines, pack, parseCommand, run, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
+import { clean, consoleUrl, type Deps, deploymentPage, ERRORS_SINCE_MS, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
 
 const BASE = 'https://console.example';
 
 type Route = (url: string, init: RequestInit) => Response | Promise<Response>;
 
 /** Answers by `METHOD path` (without the query); several answers for one key are used in turn, the last one repeats. */
-function fakeDeps(routes: Record<string, Route | Route[]>) {
+function fakeDeps(routes: Record<string, Route | Route[]>, maxSleeps = Infinity) {
   const printed: string[] = [];
   const errors: string[] = [];
   const requests: { method: string; url: string; headers: Record<string, string> }[] = [];
@@ -34,8 +34,12 @@ function fakeDeps(routes: Record<string, Route | Route[]>) {
 
       return await list[Math.min(n, list.length - 1)](input, init);
     }) as typeof fetch,
+    // With maxSleeps, a command that never ends (logs --follow) stops by this error.
     sleep: async (ms) => {
       slept += ms;
+      if (slept / POLL_MS > maxSleeps) {
+        throw new Error('stop');
+      }
     },
     pack: async () => ({ body: new Uint8Array([1, 2, 3]), files: 3 }),
     print: (line) => printed.push(line),
@@ -75,6 +79,17 @@ test('parseCommand: help, version and refused arguments', () => {
     [['deploy', 'out', '--runtime', 'static', '--project', 'shop'], '--project'],
     [['deploy', 'out', '--runtime', 'static', '--project', 'a/b/c'], '--project'],
     [['deploy', 'out', '--runtime', 'static', '--unknown'], 'Unknown option'],
+    [['deploy', 'out', '--runtime', 'static', '--follow'], '--follow is not an option of baua deploy'],
+    [['logs'], '--project <org>/<name> is required for baua logs'],
+    [['errors', '--project', 'shop'], '--project'],
+    [['logs', 'extra', '--project', 'acme/shop'], 'expected'],
+    [['logs', '--project', 'acme/shop', '--runtime', 'node@24'], '--runtime is not an option of baua logs'],
+    [['logs', '--project', 'acme/shop', '--stack'], '--stack is not an option of baua logs'],
+    [['errors', '--project', 'acme/shop', '-f'], '--follow is not an option of baua errors'],
+    [['logs', '--project', 'acme/shop', '--since', '1w'], '--since'],
+    [['logs', '--project', 'acme/shop', '--since', '0h'], '--since'],
+    [['errors', '--project', 'acme/shop', '--since', '2026-10-01'], '--since'],
+    [['errors', '--project', 'acme/shop', '--since', '99999d'], '--since must be at most 365d'],
   ];
   for (const [args, message] of refused) {
     const command = parseCommand(args);
@@ -282,4 +297,128 @@ test('pack: a gzip tar of the contents without "./", refusing symlinks and empty
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('parseCommand: logs and errors', () => {
+  assertEquals(parseCommand(['logs', '--project', 'acme/shop', '--since', '15m', '-f']), {
+    kind: 'logs',
+    options: { project: { org: 'acme', name: 'shop' }, preview: undefined, sinceMs: 15 * 60_000, follow: true, stack: false },
+  });
+  assertEquals(parseCommand(['errors', '--project', 'acme/shop', '--preview', 'feature/x', '--since', '7d', '--stack']), {
+    kind: 'errors',
+    options: { project: { org: 'acme', name: 'shop' }, preview: 'feature/x', sinceMs: 7 * 86_400_000, follow: false, stack: true },
+  });
+});
+
+test('clean and logLine: app text cannot control the terminal', () => {
+  assertEquals(clean('\u001b[31mred\u001b[0m\ttab\r\u0007\u009b'), 'red\ttab');
+  assertEquals(logLine({ id: 1, stream: 'stderr', ts: '2026-10-25T12:00:00Z', line: '\u001b]0;title\u0007boom', truncated: true }), '2026-10-25T12:00:00Z [stderr] ]0;titleboom …');
+  assertEquals(logLine({ id: 1, stream: 'stdout', ts: '2026-10-25T12:00:00Z', line: 'ok', truncated: false }), '2026-10-25T12:00:00Z ok');
+});
+
+const PROJECTS = json([
+  { name: 'other', branch: 'dev' },
+  { name: 'shop', branch: 'main' },
+]);
+
+const line = (id: number, text: string) => ({ id, deploymentId: 'd1', stream: 'stdout', ts: `2026-10-25T12:00:0${id}Z`, line: text, truncated: false });
+
+test('run logs: production by its branch, the newest lines, the API token sent', async () => {
+  const fake = fakeDeps({
+    'GET /api/orgs/acme/projects': PROJECTS,
+    'GET /api/orgs/acme/projects/shop/logs': json({ lines: [line(1, 'a'), line(2, 'b')], cursor: null }),
+  });
+
+  assertEquals(await run(['logs', '--project', 'acme/shop'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 0);
+  assertEquals(fake.printed, ['2026-10-25T12:00:01Z a', '2026-10-25T12:00:02Z b']);
+  assertEquals(Object.fromEntries(new URL(fake.requests[1].url).searchParams), { branch: 'main', limit: '100' });
+  assertEquals(fake.requests[1].headers.authorization, 'Bearer baua_x');
+});
+
+test('run logs --since: up to 1000 lines from then; a preview needs no project lookup', async () => {
+  const fake = fakeDeps({ 'GET /api/orgs/acme/projects/shop/logs': json({ lines: [], cursor: null }) });
+  const before = Date.now();
+
+  assertEquals(await run(['logs', '--project', 'acme/shop', '--preview', 'feature/x', '--since', '1h'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 0);
+  assertEquals(fake.requests.length, 1);
+  const query = new URL(fake.requests[0].url).searchParams;
+  assertEquals([query.get('branch'), query.get('limit')], ['feature/x', String(MAX_LOG_LINES)]);
+  const since = Date.parse(query.get('since')!);
+  assertEquals(since >= before - 3_600_000 && since <= Date.now() - 3_600_000, true);
+});
+
+test('run logs --since: more lines than one page says that only the newest are shown', async () => {
+  const fake = fakeDeps({ 'GET /api/orgs/acme/projects/shop/logs': json({ lines: [line(9, 'z')], cursor: 9 }) });
+
+  assertEquals(await run(['logs', '--project', 'acme/shop', '--preview', 'feature/x', '--since', '7d'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 0);
+  assertEquals(fake.printed, ['2026-10-25T12:00:09Z z']);
+  assertEquals(fake.errors.length, 1);
+  assertEquals(fake.errors[0].includes(`showing the newest ${MAX_LOG_LINES}`), true);
+});
+
+test('run logs --follow: polls with after, prints each line once, waits through an outage', async () => {
+  const busy = () => new Response('busy', { status: 503 });
+  const fake = fakeDeps(
+    {
+      'GET /api/orgs/acme/projects': PROJECTS,
+      'GET /api/orgs/acme/projects/shop/logs': [json({ lines: [], cursor: null }), json({ lines: [line(3, 'c')], cursor: null }), busy, busy, busy, json({ lines: [line(3, 'c'), line(4, 'd')], cursor: null })],
+    },
+    10,
+  );
+
+  await assertRejects(() => run(['logs', '--project', 'acme/shop', '--follow'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), Error, 'stop');
+  assertEquals(
+    fake.printed.filter((l) => !l.startsWith('==>')),
+    ['2026-10-25T12:00:03Z c', '2026-10-25T12:00:04Z d'],
+  );
+  assertStringIncludes(fake.printed.join('\n'), '==> 503: busy; still waiting');
+  const polls = fake.requests.filter((r) => r.url.includes('/logs')).map((r) => new URL(r.url).searchParams.get('after'));
+  assertEquals(polls.slice(0, 3), [null, null, '3']);
+});
+
+test('run logs and errors: a deploy token is refused before any request, an unknown project is named', async () => {
+  const fake = fakeDeps({ 'GET /api/orgs/acme/projects': PROJECTS });
+
+  assertEquals(await run(['logs', '--project', 'acme/shop'], { BAUA_TOKEN: 'bdt_x', BAUA_URL: BASE }, fake.deps), 1);
+  assertStringIncludes(fake.errors.at(-1)!, 'baua logs needs an API token');
+  assertEquals(fake.requests, []);
+
+  assertEquals(await run(['errors', '--project', 'acme/gone'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 1);
+  assertEquals(fake.errors.at(-1), 'error: project acme/gone not found');
+});
+
+test('run errors: groups with counts, times, trace links and with --stack the stack trace', async () => {
+  const fake = fakeDeps({
+    'GET /api/orgs/acme/projects': PROJECTS,
+    'GET /api/orgs/acme/projects/shop/errors': json({
+      errors: [
+        { type: 'TypeError', message: 'x is undefined', count: 3, first: '2026-10-25T10:00:00Z', last: '2026-10-25T12:00:00Z', traceId: 'a'.repeat(32), deploymentId: 'd1', stacktrace: 'TypeError: x\n    at f (\u001b[31mapp.js:1)' },
+        { type: '', message: '', count: 1, first: '2026-10-25T09:00:00Z', last: '2026-10-25T09:00:00Z', traceId: 'b'.repeat(32), deploymentId: 'd1', stacktrace: null },
+      ],
+    }),
+  });
+  const before = Date.now();
+
+  assertEquals(await run(['errors', '--project', 'acme/shop', '--stack'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 0);
+  assertEquals(fake.printed, [
+    '3×  TypeError: x is undefined',
+    '    last 2026-10-25T12:00:00Z, first 2026-10-25T10:00:00Z',
+    `    ${BASE}/acme/shop/traces/${'a'.repeat(32)}`,
+    '    TypeError: x',
+    '        at f (app.js:1)',
+    '',
+    '1×  (no type or message)',
+    '    last 2026-10-25T09:00:00Z, first 2026-10-25T09:00:00Z',
+    `    ${BASE}/acme/shop/traces/${'b'.repeat(32)}`,
+  ]);
+  const query = new URL(fake.requests[1].url).searchParams;
+  assertEquals([query.get('branch'), query.get('limit')], ['main', '100']);
+  assertEquals(Date.parse(query.get('since')!) >= before - ERRORS_SINCE_MS, true);
+});
+
+test('run errors: nothing found', async () => {
+  const fake = fakeDeps({ 'GET /api/orgs/acme/projects/shop/errors': json({ errors: [] }) });
+
+  assertEquals(await run(['errors', '--project', 'acme/shop', '--preview', 'pr-1', '--since', '15m'], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 0);
+  assertMatch(fake.printed[0], /^no errors since \d{4}-\d{2}-\d{2}T/);
 });

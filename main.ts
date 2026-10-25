@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * The baua CLI: `baua deploy <dir> --runtime <runtime>` uploads a directory that CI has built and follows the deployment until it runs (https://console.baua.ch/docs/deploy-from-ci).
+ * The baua CLI: `baua deploy <dir> --runtime <runtime>` uploads a directory that CI has built and follows the deployment until it runs (https://console.baua.ch/docs/deploy-from-ci);
+ * `baua logs` prints an app's log lines and `baua errors` the exceptions it reported through OpenTelemetry (https://console.baua.ch/docs/cli).
  * Runs on Node.js 24 and Deno 2 without dependencies; packs with the system `tar`.
  *
  * @module
@@ -15,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 /** Kept equal to jsr.json's version (a unit test checks it). */
-export const VERSION = '0.1.1';
+export const VERSION = '0.2.0';
 
 export const DEFAULT_URL = 'https://console.baua.ch';
 
@@ -28,20 +29,44 @@ export const TIMEOUT_MS = 30 * 60_000;
 
 const RETRIES = 3;
 
-const USAGE = `Usage: baua deploy <dir> --runtime <runtime> [--start <command>] [--preview <name>] [--project <org>/<name>]
+/** `baua logs` without --since: the newest lines, as many as the API gives by default. */
+export const LOG_LINES = 100;
 
-Uploads the built app in <dir> to baua and follows the deployment until it runs.
+/** The API's largest page of log lines: `baua logs --since` and each poll of --follow. */
+export const MAX_LOG_LINES = 1000;
+
+/** `baua errors` without --since. */
+export const ERRORS_SINCE_MS = 24 * 3_600_000;
+
+const MAX_ERROR_GROUPS = 100;
+
+/** baua keeps logs and traces for days, not years; the API takes no time before 1970. */
+const MAX_SINCE_MS = 365 * 86_400_000;
+
+const UNIT_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
+
+const USAGE = `Usage:
+  baua deploy <dir> --runtime <runtime> [--start <command>] [--preview <name>] [--project <org>/<name>]
+  baua logs --project <org>/<name> [--preview <name>] [--since <time>] [--follow]
+  baua errors --project <org>/<name> [--preview <name>] [--since <time>] [--stack]
+
+  deploy   uploads the built app in <dir> to baua and follows the deployment until it runs
+  logs     prints the app's log lines
+  errors   lists the exceptions the app reported through OpenTelemetry, grouped by type and message
 
 Options:
-  --runtime <runtime>   ${RUNTIMES.join(', ')}
-  --start <command>     the start command; required for dotnet@* and binary (e.g. ./App or ./server)
-  --preview <name>      deploy a preview with this name instead of production
-  --project <org>/<name>  the project; optional with a deploy token (bdt_…)
+  --runtime <runtime>   deploy: ${RUNTIMES.join(', ')}
+  --start <command>     deploy: the start command; required for dotnet@* and binary (e.g. ./App or ./server)
+  --preview <name>      the preview with this name instead of production
+  --project <org>/<name>  the project; deploy: optional with a deploy token (bdt_…)
+  --since <time>        logs, errors: how far back, e.g. 15m, 1h, 24h, 7d (logs: default the newest ${LOG_LINES} lines; errors: default 24h)
+  -f, --follow          logs: keep printing new lines until Ctrl+C
+  --stack               errors: print the newest stack trace of each group
   -h, --help            show this help
   -v, --version         show the version
 
 Environment:
-  BAUA_TOKEN            a deploy token (bdt_…) or an API token (baua_…), required
+  BAUA_TOKEN            required: a deploy token (bdt_…, deploy only) or an API token (baua_…)
   BAUA_URL              the console, default ${DEFAULT_URL}`;
 
 export interface DeployOptions {
@@ -52,7 +77,16 @@ export interface DeployOptions {
   project?: { org: string; name: string };
 }
 
-export type Command = { kind: 'help' } | { kind: 'version' } | { kind: 'deploy'; options: DeployOptions } | { kind: 'error'; message: string };
+/** The options of `baua logs` and `baua errors`. */
+export interface ReadOptions {
+  project: { org: string; name: string };
+  preview?: string;
+  sinceMs?: number;
+  follow: boolean;
+  stack: boolean;
+}
+
+export type Command = { kind: 'help' } | { kind: 'version' } | { kind: 'deploy'; options: DeployOptions } | { kind: 'logs' | 'errors'; options: ReadOptions } | { kind: 'error'; message: string };
 
 export interface Deps {
   fetch: typeof fetch;
@@ -75,6 +109,9 @@ class UnreachableError extends CliError {}
 
 const UNAVAILABLE = [502, 503, 504];
 
+/** The options only some commands take. */
+const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'] };
+
 /** Parses and checks the arguments locally, before anything is packed or sent. */
 export function parseCommand(args: string[]): Command {
   let parsed;
@@ -88,6 +125,9 @@ export function parseCommand(args: string[]): Command {
         start: { type: 'string' },
         preview: { type: 'string' },
         project: { type: 'string' },
+        since: { type: 'string' },
+        follow: { type: 'boolean', short: 'f' },
+        stack: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -105,8 +145,50 @@ export function parseCommand(args: string[]): Command {
     return { kind: 'version' };
   }
 
-  if (positionals[0] !== 'deploy' || positionals.length !== 2) {
-    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime> (see --help)' };
+  const command = positionals[0];
+  const read = (command === 'logs' || command === 'errors') && positionals.length === 1;
+  if (!read && !(command === 'deploy' && positionals.length === 2)) {
+    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs or baua errors (see --help)' };
+  }
+
+  const wrong = Object.keys(ONLY).find((name) => values[name as keyof typeof values] !== undefined && !ONLY[name].includes(command));
+  if (wrong) {
+    return { kind: 'error', message: `--${wrong} is not an option of baua ${command}` };
+  }
+
+  if (values.preview !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(values.preview)) {
+    return { kind: 'error', message: '--preview must be a branch-like name: letters, digits, ".", "_", "/" and "-"' };
+  }
+
+  let project: { org: string; name: string } | undefined;
+  if (values.project !== undefined) {
+    const match = /^([^/\s]+)\/([^/\s]+)$/.exec(values.project);
+    if (!match) {
+      return { kind: 'error', message: '--project must be <org>/<name>' };
+    }
+
+    project = { org: match[1], name: match[2] };
+  }
+
+  if (command === 'logs' || command === 'errors') {
+    if (!project) {
+      return { kind: 'error', message: `--project <org>/<name> is required for baua ${command}` };
+    }
+
+    let sinceMs: number | undefined;
+    if (values.since !== undefined) {
+      const match = /^([1-9][0-9]{0,4})([mhd])$/.exec(values.since);
+      if (!match) {
+        return { kind: 'error', message: '--since must be a time like 15m, 1h, 24h or 7d' };
+      }
+
+      sinceMs = Number(match[1]) * UNIT_MS[match[2]];
+      if (sinceMs > MAX_SINCE_MS) {
+        return { kind: 'error', message: '--since must be at most 365d' };
+      }
+    }
+
+    return { kind: command, options: { project, preview: values.preview, sinceMs, follow: values.follow === true, stack: values.stack === true } };
   }
 
   const runtime = values.runtime;
@@ -119,21 +201,7 @@ export function parseCommand(args: string[]): Command {
     return { kind: 'error', message: `--start is required for ${runtime} (e.g. ${runtime === 'binary' ? './server' : './App'})` };
   }
 
-  if (values.preview !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(values.preview)) {
-    return { kind: 'error', message: '--preview must be a branch-like name: letters, digits, ".", "_", "/" and "-"' };
-  }
-
-  const options: DeployOptions = { dir: positionals[1], runtime, start, preview: values.preview };
-  if (values.project !== undefined) {
-    const match = /^([^/\s]+)\/([^/\s]+)$/.exec(values.project);
-    if (!match) {
-      return { kind: 'error', message: '--project must be <org>/<name>' };
-    }
-
-    options.project = { org: match[1], name: match[2] };
-  }
-
-  return { kind: 'deploy', options };
+  return { kind: 'deploy', options: { dir: positionals[1], runtime, start, preview: values.preview, project } };
 }
 
 /** BAUA_URL without trailing slashes, or the default; https only, except for a local baua, so the token never travels in clear text. */
@@ -325,7 +393,16 @@ export async function run(args: string[], env: Record<string, string | undefined
   }
 
   try {
-    return await deploy(deps, consoleUrl(env.BAUA_URL), token, command.options);
+    const base = consoleUrl(env.BAUA_URL);
+    if (command.kind === 'deploy') {
+      return await deploy(deps, base, token, command.options);
+    }
+
+    if (token.startsWith('bdt_')) {
+      throw new CliError(`baua ${command.kind} needs an API token (baua_…) and --project; a deploy token can only deploy`);
+    }
+
+    return command.kind === 'logs' ? await printLogs(deps, base, token, command.options) : await printErrors(deps, base, token, command.options);
   } catch (error) {
     if (error instanceof CliError) {
       deps.error(`error: ${error.message}`);
@@ -367,6 +444,134 @@ async function deploy(deps: Deps, base: string, token: string, options: DeployOp
   deps.error(`see ${deploymentPage(base, project, created.id)}`);
 
   return 1;
+}
+
+/** App text without escape sequences and control characters (tabs stay): an app's output must not control the user's terminal. */
+export function clean(text: string): string {
+  return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/g, '');
+}
+
+function projectApi(base: string, project: { org: string; name: string }): string {
+  return `${base}/api/orgs/${encodeURIComponent(project.org)}/projects/${encodeURIComponent(project.name)}`;
+}
+
+/** The branch the API filters by: the preview's name, or the project's production branch. */
+async function branchOf(deps: Deps, base: string, token: string, options: ReadOptions): Promise<string> {
+  if (options.preview) {
+    return options.preview;
+  }
+
+  const { org, name } = options.project;
+  const projects = await getJson<{ name: string; branch: string }[]>(deps, `${base}/api/orgs/${encodeURIComponent(org)}/projects`, token);
+  const found = projects.find((p) => p.name === name);
+  if (!found) {
+    throw new CliError(`project ${org}/${name} not found`);
+  }
+
+  return found.branch;
+}
+
+interface LogLine {
+  id: number;
+  stream: string;
+  ts: string;
+  line: string;
+  truncated: boolean;
+}
+
+export function logLine(line: LogLine): string {
+  return `${line.ts} ${line.stream === 'stderr' ? '[stderr] ' : ''}${clean(line.line)}${line.truncated ? ' …' : ''}`;
+}
+
+/** `baua logs`: the newest lines (or those since --since), then with --follow every new line until Ctrl+C. */
+async function printLogs(deps: Deps, base: string, token: string, options: ReadOptions): Promise<number> {
+  const branch = await branchOf(deps, base, token, options);
+  const url = `${projectApi(base, options.project)}/logs`;
+  const since = options.sinceMs === undefined ? undefined : new Date(Date.now() - options.sinceMs).toISOString();
+  const first = new URLSearchParams({ branch, limit: String(since ? MAX_LOG_LINES : LOG_LINES) });
+  if (since) {
+    first.set('since', since);
+  }
+
+  const answer = await getJson<{ lines: LogLine[]; cursor: number | null }>(deps, `${url}?${first}`, token);
+  let lines = answer.lines;
+  if (since && answer.cursor !== null) {
+    deps.error(`==> more than ${MAX_LOG_LINES} lines since ${since}: showing the newest ${MAX_LOG_LINES}`);
+  }
+
+  let last = 0;
+  for (;;) {
+    for (const line of lines.filter((l) => l.id > last)) {
+      deps.print(logLine(line));
+      last = line.id;
+    }
+
+    if (!options.follow) {
+      return 0;
+    }
+
+    await deps.sleep(POLL_MS);
+    // ponytail: more than MAX_LOG_LINES new lines within one poll: the older of them are skipped (the API answers the newest).
+    const next = new URLSearchParams({ branch, limit: String(MAX_LOG_LINES) });
+    if (last > 0) {
+      next.set('after', String(last));
+    } else if (since) {
+      next.set('since', since);
+    }
+
+    try {
+      ({ lines } = await getJson<{ lines: LogLine[] }>(deps, `${url}?${next}`, token));
+    } catch (error) {
+      if (!(error instanceof UnreachableError)) {
+        throw error;
+      }
+
+      deps.print(`==> ${error.message}; still waiting`);
+      lines = [];
+    }
+  }
+}
+
+interface ErrorGroup {
+  type: string;
+  message: string;
+  count: number;
+  first: string;
+  last: string;
+  traceId: string;
+  stacktrace: string | null;
+}
+
+/** `baua errors`: the groups of exceptions, newest first, each with a link to its newest trace. */
+async function printErrors(deps: Deps, base: string, token: string, options: ReadOptions): Promise<number> {
+  const branch = await branchOf(deps, base, token, options);
+  const since = new Date(Date.now() - (options.sinceMs ?? ERRORS_SINCE_MS)).toISOString();
+  const query = new URLSearchParams({ branch, since, limit: String(MAX_ERROR_GROUPS) });
+  const { errors } = await getJson<{ errors: ErrorGroup[] }>(deps, `${projectApi(base, options.project)}/errors?${query}`, token);
+  if (errors.length === 0) {
+    deps.print(`no errors since ${since}`);
+
+    return 0;
+  }
+
+  const { org, name } = options.project;
+  for (const [i, group] of errors.entries()) {
+    if (i > 0) {
+      deps.print('');
+    }
+
+    const title = [clean(group.type), clean(group.message)].filter(Boolean).join(': ') || '(no type or message)';
+    deps.print(`${group.count}×  ${title}`);
+    deps.print(`    last ${group.last}, first ${group.first}`);
+    deps.print(`    ${base}/${encodeURIComponent(org)}/${encodeURIComponent(name)}/traces/${encodeURIComponent(group.traceId)}`);
+    if (options.stack && group.stacktrace) {
+      for (const line of group.stacktrace.split('\n')) {
+        deps.print(`    ${clean(line)}`);
+      }
+    }
+  }
+
+  return 0;
 }
 
 /** Packs the directory's contents with the system tar (flags GNU tar and bsdtar share); refuses symlinks, which baua refuses too. */
