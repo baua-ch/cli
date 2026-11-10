@@ -2,7 +2,8 @@
 /**
  * The baua CLI: `baua deploy <dir> --runtime <runtime>` uploads a directory that CI has built and follows the deployment until it runs (https://console.baua.ch/docs/deploy-from-ci);
  * `baua logs` prints an app's log lines and `baua errors` the exceptions it reported through OpenTelemetry; `baua env pull` writes an app's
- * environment variables to a .env file and `baua run` starts a local command with them (https://console.baua.ch/docs/cli).
+ * environment variables to a .env file and `baua run` starts a local command with them; `baua tunnel` connects a local debugger to a
+ * preview in debug mode (https://console.baua.ch/docs/cli).
  * Runs on Node.js 24 and Deno 2 without dependencies; packs with the system `tar`.
  *
  * @module
@@ -11,6 +12,7 @@ import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer, type Server, type Socket } from 'node:net';
 import { constants } from 'node:os';
 import { join, relative } from 'node:path';
 import process from 'node:process';
@@ -18,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 /** Kept equal to jsr.json's version (a unit test checks it). */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 export const DEFAULT_URL = 'https://console.baua.ch';
 
@@ -47,18 +49,31 @@ const MAX_SINCE_MS = 365 * 86_400_000;
 
 const UNIT_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
 
+/** The inspector's port, locally as in the container. */
+export const DEBUG_PORT = 9229;
+
+/** baua closes a tunnel after this long at the latest (https://console.baua.ch/docs/debugging). */
+export const TUNNEL_MAX_MS = 60 * 60_000;
+
+const TUNNEL_WARN_MS = 5 * 60_000;
+
+/** baua's reasons for closing a tunnel that are no failure: exit code 0. */
+const QUIET_ENDS = ['idle', 'time limit'];
+
 const USAGE = `Usage:
   baua deploy <dir> --runtime <runtime> [--start <command>] [--preview <name>] [--project <org>/<name>]
   baua logs --project <org>/<name> [--preview <name>] [--since <time>] [--follow]
   baua errors --project <org>/<name> [--preview <name>] [--since <time>] [--stack]
   baua env pull [<file>] --project <org>/<name> [--preview <name>] [--force]
   baua run --project <org>/<name> [--preview <name>] -- <command> [<args>…]
+  baua tunnel --project <org>/<name> --preview <name> [--port <port>]
 
   deploy   uploads the built app in <dir> to baua and follows the deployment until it runs
   logs     prints the app's log lines
   errors   lists the exceptions the app reported through OpenTelemetry, grouped by type and message
   env pull writes the app's environment variables to <file> (default .env); --force overwrites it
   run      starts <command> on this machine with the app's environment variables, without writing them to disk
+  tunnel   connects a debugger on this machine to a preview in debug mode, on 127.0.0.1:<port>
 
 Options:
   --runtime <runtime>   deploy: ${RUNTIMES.join(', ')}
@@ -69,6 +84,7 @@ Options:
   -f, --follow          logs: keep printing new lines until Ctrl+C
   --stack               errors: print the newest stack trace of each group
   --force               env pull: overwrite an existing file
+  --port <port>         tunnel: the local port, default ${DEBUG_PORT}
   -h, --help            show this help
   -v, --version         show the version
 
@@ -99,6 +115,12 @@ export interface EnvOptions {
   preview?: string;
 }
 
+export interface TunnelOptions {
+  project: { org: string; name: string };
+  preview: string;
+  port: number;
+}
+
 export type Command =
   | { kind: 'help' }
   | { kind: 'version' }
@@ -106,6 +128,7 @@ export type Command =
   | { kind: 'logs' | 'errors'; options: ReadOptions }
   | { kind: 'env'; options: EnvOptions & { file: string; force: boolean } }
   | { kind: 'run'; options: EnvOptions & { command: string[] } }
+  | { kind: 'tunnel'; options: TunnelOptions }
   | { kind: 'error'; message: string };
 
 export interface Deps {
@@ -116,6 +139,9 @@ export interface Deps {
   exec: (command: string[], vars: Record<string, string>) => Promise<number>;
   print: (line: string) => void;
   error: (line: string) => void;
+  webSocket: (url: string) => WebSocket;
+  /** Calls the handler on Ctrl+C; returns the function that stops it. */
+  onInterrupt: (handler: () => void) => () => void;
 }
 
 export interface Packed {
@@ -132,7 +158,7 @@ class UnreachableError extends CliError {}
 const UNAVAILABLE = [502, 503, 504];
 
 /** The options only some commands take. */
-const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'], force: ['env'] };
+const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'], force: ['env'], port: ['tunnel'] };
 
 /** Parses and checks the arguments locally, before anything is packed or sent. */
 export function parseCommand(args: string[]): Command {
@@ -151,6 +177,7 @@ export function parseCommand(args: string[]): Command {
         follow: { type: 'boolean', short: 'f' },
         stack: { type: 'boolean' },
         force: { type: 'boolean' },
+        port: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -179,8 +206,9 @@ export function parseCommand(args: string[]): Command {
   const read = (command === 'logs' || command === 'errors') && positionals.length === 1;
   const pull = command === 'env' && positionals[1] === 'pull' && positionals.length <= 3;
   const runs = command === 'run';
-  if (!read && !pull && !runs && !(command === 'deploy' && positionals.length === 2)) {
-    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs, baua errors, baua env pull or baua run -- <command> (see --help)' };
+  const tunnel = command === 'tunnel' && positionals.length === 1;
+  if (!read && !pull && !runs && !tunnel && !(command === 'deploy' && positionals.length === 2)) {
+    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs, baua errors, baua env pull, baua run -- <command> or baua tunnel (see --help)' };
   }
 
   const wrong = Object.keys(ONLY).find((name) => values[name as keyof typeof values] !== undefined && !ONLY[name].includes(command));
@@ -212,6 +240,19 @@ export function parseCommand(args: string[]): Command {
 
   if (command === 'run' && project) {
     return { kind: 'run', options: { project, preview: values.preview, command: runCommand } };
+  }
+
+  if (command === 'tunnel' && project) {
+    if (values.preview === undefined) {
+      return { kind: 'error', message: '--preview <name> is required for baua tunnel: only previews run with a debugger' };
+    }
+
+    const port = Number(values.port ?? DEBUG_PORT);
+    if (!/^[1-9][0-9]{0,4}$/.test(String(values.port ?? DEBUG_PORT)) || port > 65535) {
+      return { kind: 'error', message: '--port must be a port number from 1 to 65535' };
+    }
+
+    return { kind: 'tunnel', options: { project, preview: values.preview, port } };
   }
 
   if ((command === 'logs' || command === 'errors') && project) {
@@ -448,6 +489,10 @@ export async function run(args: string[], env: Record<string, string | undefined
 
     if (command.kind === 'run') {
       return await runWithEnv(deps, base, token, command.options);
+    }
+
+    if (command.kind === 'tunnel') {
+      return await openTunnel(deps, base, token, command.options);
     }
 
     return command.kind === 'logs' ? await printLogs(deps, base, token, command.options) : await printErrors(deps, base, token, command.options);
@@ -711,6 +756,201 @@ async function runWithEnv(deps: Deps, base: string, token: string, options: EnvO
   return await deps.exec(options.command, env);
 }
 
+/** Listens on 127.0.0.1 only; a connection stays paused until the inspector behind the tunnel is there. */
+function listen(port: number): Promise<Server> {
+  return new Promise((resolve, reject) => {
+    const server = createServer({ pauseOnConnect: true });
+    server.once('error', (error: Error & { code?: string }) => {
+      reject(new CliError(error.code === 'EADDRINUSE' ? `port ${port} is in use (a local debugger or another tunnel?); choose another with --port` : `cannot listen on 127.0.0.1:${port}: ${error.message}`));
+    });
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
+}
+
+/** The ticket's WebSocket URL, only on the console's own host, so the ticket goes nowhere else. */
+async function tunnelUrl(deps: Deps, base: string, token: string, options: TunnelOptions): Promise<string> {
+  // Never retried: a lost answer would leave a ticket that is used only once.
+  let res: Response;
+  try {
+    res = await deps.fetch(`${projectApi(base, options.project)}/previews/${encodeURIComponent(options.preview)}/tunnel`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, redirect: 'error' });
+  } catch (error) {
+    throw new CliError(`cannot reach ${new URL(base).origin}: ${(error as Error).message}`);
+  }
+
+  if (res.status !== 201) {
+    throw new CliError(`tunnel refused: ${await serverMessage(res)}`);
+  }
+
+  const { url } = (await res.json()) as { url: string };
+  const socketUrl = new URL(url);
+  const consoleOrigin = new URL(base);
+  if (socketUrl.host !== consoleOrigin.host || socketUrl.protocol !== (consoleOrigin.protocol === 'https:' ? 'wss:' : 'ws:')) {
+    throw new CliError(`baua answered a tunnel on another host: ${socketUrl.origin}`);
+  }
+
+  return url;
+}
+
+/** `baua tunnel`: listens first, so a busy port fails before a ticket is used; then forwards until the tunnel closes. */
+async function openTunnel(deps: Deps, base: string, token: string, options: TunnelOptions): Promise<number> {
+  const server = await listen(options.port);
+
+  try {
+    const url = await tunnelUrl(deps, base, token, options);
+
+    return await forward(deps, deps.webSocket(url), server, attachHelp(base, options));
+  } finally {
+    server.close();
+  }
+}
+
+function attachHelp(base: string, options: TunnelOptions): string[] {
+  const until = new Date(Date.now() + TUNNEL_MAX_MS).toTimeString().slice(0, 5);
+
+  return [
+    `==> tunnel to preview ${options.preview} of ${options.project.org}/${options.project.name} on 127.0.0.1:${options.port}, until ${until} at the latest`,
+    `    Chrome: chrome://inspect, Configure… with localhost:${options.port}, then inspect under your app`,
+    `    VS Code: an "attach" configuration with "address": "127.0.0.1", "port": ${options.port}, "remoteRoot": "/app" (${base}/docs/debugging)`,
+    '    It closes after 15 minutes without traffic, after 60 minutes, or with Ctrl+C.',
+  ];
+}
+
+/**
+ * Forwards one local connection at a time over the tunnel's WebSocket: `{"type":"connect"}` opens a connection to the inspector,
+ * `connected` confirms it, binary messages are its bytes, `disconnect` and `disconnected` end it. A new local connection replaces the
+ * current one, as a debugger opens one after the other (DevTools: the target list, then its WebSocket).
+ */
+export function forward(deps: Deps, ws: WebSocket, server: Server, help: string[]): Promise<number> {
+  return new Promise((resolve) => {
+    ws.binaryType = 'arraybuffer';
+    let opened = false;
+    let interrupted = false;
+    let current: Socket | null = null;
+    // `connecting`: a connect is on its way; the inspector connection it brings goes to whichever local connection is current then.
+    let state: 'idle' | 'connecting' | 'connected' = 'idle';
+    const send = (type: string) => ws.send(JSON.stringify({ type }));
+    const request = () => {
+      if (state === 'connected') {
+        send('disconnect');
+      }
+
+      send('connect');
+      state = 'connecting';
+    };
+
+    server.on('connection', (socket: Socket) => {
+      socket.on('error', () => socket.destroy());
+      current?.destroy();
+      current = socket;
+      socket.on('data', (chunk: Buffer) => {
+        if (socket === current && state === 'connected') {
+          ws.send(chunk);
+        }
+      });
+      socket.on('close', () => {
+        if (socket !== current) {
+          return;
+        }
+
+        current = null;
+        if (state === 'connected') {
+          send('disconnect');
+          state = 'idle';
+        }
+      });
+
+      if (opened && state !== 'connecting') {
+        request();
+      }
+    });
+
+    ws.addEventListener('open', () => {
+      opened = true;
+      for (const line of help) {
+        deps.print(line);
+      }
+
+      if (current) {
+        request();
+      }
+    });
+
+    ws.addEventListener('message', (event: MessageEvent) => {
+      if (typeof event.data !== 'string') {
+        if (state === 'connected') {
+          current?.write(new Uint8Array(event.data as ArrayBuffer));
+        }
+
+        return;
+      }
+
+      const type = controlType(event.data);
+      if (type === 'connected' && state === 'connecting') {
+        if (current) {
+          state = 'connected';
+          current.resume();
+        } else {
+          send('disconnect');
+          state = 'idle';
+        }
+      } else if (type === 'disconnected' && state === 'connected') {
+        // The inspector closed the connection.
+        state = 'idle';
+        const socket = current;
+        current = null;
+        socket?.end();
+      }
+    });
+
+    const warning = setTimeout(() => deps.print(`==> ${TUNNEL_WARN_MS / 60_000} minutes left; then open a new tunnel`), TUNNEL_MAX_MS - TUNNEL_WARN_MS);
+    const stop = deps.onInterrupt(() => {
+      interrupted = true;
+      ws.close(1000);
+    });
+
+    ws.addEventListener('close', (event: CloseEvent) => {
+      clearTimeout(warning);
+      stop();
+      current?.destroy();
+      current = null;
+      if (interrupted) {
+        deps.print('==> tunnel closed');
+        resolve(0);
+
+        return;
+      }
+
+      const reason = clean(event.reason);
+      if (!opened) {
+        deps.error(`error: the tunnel could not be opened${reason ? `: ${reason}` : ''}; try again`);
+        resolve(1);
+
+        return;
+      }
+
+      if (QUIET_ENDS.includes(reason)) {
+        deps.print(`==> tunnel closed: ${reason}`);
+        resolve(0);
+
+        return;
+      }
+
+      deps.error(`error: tunnel closed: ${reason || `code ${event.code}`}`);
+      resolve(1);
+    });
+  });
+}
+
+function controlType(text: string): string | undefined {
+  try {
+    const message = JSON.parse(text) as { type?: unknown };
+
+    return typeof message.type === 'string' ? message.type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Runs the command without a shell, its output on this terminal; the variables replace those of the same name in the CLI's environment. */
 export function exec(command: string[], vars: Record<string, string>): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -811,6 +1051,12 @@ if (import.meta.main ?? (process.argv[1] !== undefined && realpathSync(process.a
     exec,
     print: (line) => console.log(line),
     error: (line) => console.error(line),
+    webSocket: (url) => new WebSocket(url),
+    onInterrupt: (handler) => {
+      process.on('SIGINT', handler);
+
+      return () => process.off('SIGINT', handler);
+    },
   };
 
   // Not process.exit: output to a pipe may still be pending.

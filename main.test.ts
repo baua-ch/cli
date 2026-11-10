@@ -3,8 +3,9 @@ import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import { assertEquals, assertMatch, assertRejects, assertStringIncludes, assertThrows } from '@std/assert';
-import { clean, consoleUrl, type Deps, deploymentPage, dotenv, ERRORS_SINCE_MS, exec, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, scopeValues, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
+import { type AddressInfo, connect, createServer } from 'node:net';
+import { assert, assertEquals, assertMatch, assertRejects, assertStringIncludes, assertThrows } from '@std/assert';
+import { clean, consoleUrl, DEBUG_PORT, type Deps, deploymentPage, dotenv, ERRORS_SINCE_MS, exec, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, scopeValues, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
 
 const BASE = 'https://console.example';
 
@@ -50,6 +51,10 @@ function fakeDeps(routes: Record<string, Route | Route[]>, maxSleeps = Infinity)
     },
     print: (line) => printed.push(line),
     error: (line) => errors.push(line),
+    webSocket: () => {
+      throw new Error('no WebSocket in this test');
+    },
+    onInterrupt: () => () => {},
   };
 
   return { deps, printed, errors, requests, executed, slept: () => slept };
@@ -516,4 +521,207 @@ test('exec: the variables reach the command, its exit code comes back', async ()
   assertEquals(await exec([process.execPath, '-e', 'process.kill(process.pid, "SIGTERM")'], {}), process.platform === 'win32' ? 1 : 143);
   await assertRejects(() => exec(['baua-no-such-command'], {}), Error, 'cannot run baua-no-such-command');
   await assertRejects(() => exec([''], {}), Error, 'cannot run');
+});
+
+/** A WebSocket the test drives: what the CLI sent, and the server's side with open, receive and close. */
+class FakeWebSocket extends EventTarget {
+  binaryType = 'blob';
+  sent: (string | Uint8Array)[] = [];
+  closedWith: number | undefined;
+
+  send(data: string | Uint8Array) {
+    this.sent.push(typeof data === 'string' ? data : new Uint8Array(data));
+  }
+
+  close(code = 1000, reason = '') {
+    this.closedWith = code;
+    this.dispatchEvent(Object.assign(new Event('close'), { code, reason }));
+  }
+
+  open() {
+    this.dispatchEvent(new Event('open'));
+  }
+
+  receive(data: string | Uint8Array) {
+    this.dispatchEvent(Object.assign(new Event('message'), { data: typeof data === 'string' ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) }));
+  }
+
+  controls(): string[] {
+    return this.sent.filter((m) => typeof m === 'string').map((m) => JSON.parse(m).type);
+  }
+
+  bytes(): string {
+    return this.sent
+      .filter((m) => typeof m !== 'string')
+      .map((m) => new TextDecoder().decode(m))
+      .join('');
+  }
+}
+
+async function until(condition: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 400 && !condition(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  if (!condition()) {
+    throw new Error(`timed out waiting for ${what}`);
+  }
+}
+
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+
+  return port;
+}
+
+const TICKET_PATH = 'POST /api/orgs/acme/projects/shop/previews/feature%2Fx/tunnel';
+
+/** `baua tunnel` with a fake console and WebSocket; `interrupt` is Ctrl+C. */
+async function tunnelSetup(answer: Route = json({ ticket: 't', url: 'wss://console.example/api/tunnel?ticket=t', expiresAt: '2026-11-10T10:00:00Z' }, 201)) {
+  const fake = fakeDeps({ [TICKET_PATH]: answer });
+  const sockets: { url: string; ws: FakeWebSocket }[] = [];
+  let interrupt: (() => void) | undefined;
+  fake.deps.webSocket = (url) => {
+    const ws = new FakeWebSocket();
+    sockets.push({ url, ws });
+
+    return ws as unknown as WebSocket;
+  };
+  fake.deps.onInterrupt = (handler) => {
+    interrupt = handler;
+
+    return () => {
+      interrupt = undefined;
+    };
+  };
+  const port = await freePort();
+  const exit = run(['tunnel', '--project', 'acme/shop', '--preview', 'feature/x', '--port', String(port)], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps);
+
+  return { fake, sockets, port, exit, interrupt: () => interrupt?.() };
+}
+
+function connectLocal(port: number) {
+  const socket = connect(port, '127.0.0.1');
+  const received: string[] = [];
+  let ended = false;
+  socket.on('data', (chunk) => received.push(chunk.toString()));
+  socket.on('error', () => {});
+  socket.on('close', () => {
+    ended = true;
+  });
+
+  return { socket, text: () => received.join(''), ended: () => ended };
+}
+
+test('parseCommand: tunnel needs a project and a preview; the port is 9229 unless given', () => {
+  assertEquals(parseCommand(['tunnel', '--project', 'acme/shop', '--preview', 'pr-1']), { kind: 'tunnel', options: { project: { org: 'acme', name: 'shop' }, preview: 'pr-1', port: DEBUG_PORT } });
+  assertEquals(parseCommand(['tunnel', '--project', 'acme/shop', '--preview', 'pr-1', '--port', '9230']), { kind: 'tunnel', options: { project: { org: 'acme', name: 'shop' }, preview: 'pr-1', port: 9230 } });
+
+  const refused: [string[], string][] = [
+    [['tunnel', '--preview', 'pr-1'], '--project'],
+    [['tunnel', '--project', 'acme/shop'], '--preview'],
+    [['tunnel', '--project', 'acme/shop', '--preview', 'pr-1', '--port', '0'], '--port'],
+    [['tunnel', '--project', 'acme/shop', '--preview', 'pr-1', '--port', '65536'], '--port'],
+    [['tunnel', '--project', 'acme/shop', '--preview', 'pr-1', '--port', '92x'], '--port'],
+    [['tunnel', 'extra', '--project', 'acme/shop', '--preview', 'pr-1'], 'expected'],
+    [['logs', '--project', 'acme/shop', '--port', '9229'], '--port is not an option of baua logs'],
+  ];
+  for (const [args, message] of refused) {
+    const command = parseCommand(args);
+    assertEquals(command.kind, 'error', args.join(' '));
+    assertStringIncludes((command as { message: string }).message, message);
+  }
+});
+
+test('run tunnel: a ticket with the API token, the WebSocket on the console host, then bytes both ways for one local connection at a time; Ctrl+C ends with 0', async () => {
+  const { fake, sockets, port, exit, interrupt } = await tunnelSetup();
+  await until(() => sockets.length === 1, 'the WebSocket');
+  const { url, ws } = sockets[0];
+  assertEquals(url, 'wss://console.example/api/tunnel?ticket=t');
+  assertEquals(fake.requests[0].headers, { authorization: 'Bearer baua_x' });
+  assertEquals(ws.binaryType, 'arraybuffer');
+
+  ws.open();
+  assertStringIncludes(fake.printed[0], `tunnel to preview feature/x of acme/shop on 127.0.0.1:${port}`);
+  assert(!fake.printed.join('\n').includes('ticket=t'), 'the ticket is never printed');
+
+  const first = connectLocal(port);
+  await until(() => ws.controls().length === 1, 'connect');
+  assertEquals(ws.controls(), ['connect']);
+  first.socket.write('GET /json/list');
+  ws.receive('{"type":"connected"}');
+  await until(() => ws.bytes() === 'GET /json/list', 'the bytes held until connected');
+  ws.receive(new TextEncoder().encode('[{"id":"1"}]'));
+  await until(() => first.text() === '[{"id":"1"}]', 'the answer');
+
+  // The inspector closes the connection: the local one ends too.
+  ws.receive('{"type":"disconnected"}');
+  await until(first.ended, 'the local connection to end');
+
+  // The next connection asks again; a third one meanwhile replaces it.
+  const second = connectLocal(port);
+  await until(() => ws.controls().length === 2, 'the second connect');
+  ws.receive('{"type":"connected"}');
+  const third = connectLocal(port);
+  await until(() => ws.controls().length === 4, 'disconnect and connect for the third');
+  await until(second.ended, 'the replaced connection to end');
+  assertEquals(ws.controls(), ['connect', 'connect', 'disconnect', 'connect']);
+  ws.receive(new TextEncoder().encode('stale'));
+  ws.receive('{"type":"disconnected"}');
+  ws.receive('{"type":"connected"}');
+  ws.receive(new TextEncoder().encode('fresh'));
+  await until(() => third.text() === 'fresh', "only the new connection's bytes");
+
+  interrupt();
+  assertEquals(await exit, 0);
+  assertEquals(ws.closedWith, 1000);
+  assertEquals(fake.printed.at(-1), '==> tunnel closed');
+  await until(third.ended, 'the local connection to close');
+});
+
+test('run tunnel: a refused ticket names the reason and opens no WebSocket; a tunnel URL on another host is refused', async () => {
+  const refused = await tunnelSetup(json({ error: 'this preview is not in debug mode' }, 409));
+  assertEquals(await refused.exit, 1);
+  assertEquals(refused.fake.errors, ['error: tunnel refused: 409: this preview is not in debug mode']);
+  assertEquals(refused.sockets, []);
+
+  const elsewhere = await tunnelSetup(json({ ticket: 't', url: 'wss://evil.example/api/tunnel?ticket=t', expiresAt: '' }, 201));
+  assertEquals(await elsewhere.exit, 1);
+  assertStringIncludes(elsewhere.fake.errors[0], 'another host: wss://evil.example');
+  assertEquals(elsewhere.sockets, []);
+});
+
+test('run tunnel: baua closing it names the reason; idle and the time limit end with 0, anything else with 1', async () => {
+  for (const [reason, code] of [['time limit', 0], ['idle', 0], ['redeploy', 1], ['switch-off', 1]] as const) {
+    const { fake, sockets, exit } = await tunnelSetup();
+    await until(() => sockets.length === 1, 'the WebSocket');
+    sockets[0].ws.open();
+    sockets[0].ws.close(4000, reason);
+    assertEquals(await exit, code, reason);
+    assertEquals(code === 0 ? fake.printed.at(-1) : fake.errors.at(-1), code === 0 ? `==> tunnel closed: ${reason}` : `error: tunnel closed: ${reason}`);
+  }
+
+  const { fake, sockets, exit } = await tunnelSetup();
+  await until(() => sockets.length === 1, 'the WebSocket');
+  sockets[0].ws.close(1006);
+  assertEquals(await exit, 1);
+  assertEquals(fake.errors, ['error: the tunnel could not be opened; try again']);
+});
+
+test('run tunnel: a busy port fails before a ticket is asked for', async () => {
+  const busy = createServer();
+  await new Promise<void>((resolve) => busy.listen(0, '127.0.0.1', resolve));
+  const { port } = busy.address() as AddressInfo;
+  const fake = fakeDeps({ [TICKET_PATH]: json({}, 201) });
+
+  try {
+    assertEquals(await run(['tunnel', '--project', 'acme/shop', '--preview', 'feature/x', '--port', String(port)], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps), 1);
+    assertStringIncludes(fake.errors[0], `port ${port} is in use`);
+    assertEquals(fake.requests, []);
+  } finally {
+    await new Promise((resolve) => busy.close(resolve));
+  }
 });

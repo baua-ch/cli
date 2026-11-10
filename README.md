@@ -44,6 +44,14 @@ BAUA_TOKEN=baua_… baua env pull --project acme/shop --preview pr-1   # writes 
 
 `run` starts the command after `--` with the app's environment variables, without writing them to disk; its exit code is the CLI's. `env pull` writes them to a new file only you can read (default `.env`, `--force` replaces one). Production, or the previews' values with `--preview <name>`; an API token, not a deploy token.
 
+## Debug a preview
+
+```sh
+BAUA_TOKEN=baua_… baua tunnel --project acme/shop --preview feature/x   # 127.0.0.1:9229, --port for another
+```
+
+`tunnel` connects Chrome DevTools or VS Code on your computer to a preview that runs with the debugger (Node.js and Deno), through baua. It listens on `127.0.0.1` only and closes after 15 minutes without traffic, after 60 minutes or with Ctrl+C. An API token, not a deploy token: [console.baua.ch/docs/debugging](https://console.baua.ch/docs/debugging).
+
 ## GitHub Actions
 
 ```yaml
