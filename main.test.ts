@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { type AddressInfo, connect, createServer } from 'node:net';
 import { assert, assertEquals, assertMatch, assertRejects, assertStringIncludes, assertThrows } from '@std/assert';
-import { clean, consoleUrl, DEBUG_PORT, type Deps, deploymentPage, dotenv, ERRORS_SINCE_MS, exec, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, scopeValues, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
+import { clean, consoleUrl, DEBUG_PORT, type Deps, deploymentPage, dotenv, ERRORS_SINCE_MS, exec, frame, launchConfig, launchText, logLine, MAX_LOG_LINES, newLines, pack, parseCommand, run, scopeValues, TIMEOUT_MS, POLL_MS, uploadUrl, VERSION } from './main.ts';
 
 const BASE = 'https://console.example';
 
@@ -55,6 +55,7 @@ function fakeDeps(routes: Record<string, Route | Route[]>, maxSleeps = Infinity)
       throw new Error('no WebSocket in this test');
     },
     onInterrupt: () => () => {},
+    cwd: () => '.',
   };
 
   return { deps, printed, errors, requests, executed, slept: () => slept };
@@ -546,15 +547,22 @@ class FakeWebSocket extends EventTarget {
     this.dispatchEvent(Object.assign(new Event('message'), { data: typeof data === 'string' ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) }));
   }
 
+  /** The control messages sent, as `type id`. */
   controls(): string[] {
-    return this.sent.filter((m) => typeof m === 'string').map((m) => JSON.parse(m).type);
+    return this.sent.filter((m) => typeof m === 'string').map((m) => `${JSON.parse(m).type} ${JSON.parse(m).id}`);
   }
 
-  bytes(): string {
+  /** The bytes sent for connection `id` (protocol 2: each binary message starts with its id in 4 bytes). */
+  bytes(id: number): string {
     return this.sent
-      .filter((m) => typeof m !== 'string')
-      .map((m) => new TextDecoder().decode(m))
+      .filter((m): m is Uint8Array => typeof m !== 'string' && new DataView(m.buffer, m.byteOffset).getUint32(0) === id)
+      .map((m) => new TextDecoder().decode(m.subarray(4)))
       .join('');
+  }
+
+  /** A binary message of baua for connection `id`. */
+  receiveFor(id: number, text: string) {
+    this.receive(frame(id, new TextEncoder().encode(text)));
   }
 }
 
@@ -636,7 +644,7 @@ test('parseCommand: tunnel needs a project and a preview; the port is 9229 unles
   }
 });
 
-test('run tunnel: a ticket with the API token, the WebSocket on the console host, then bytes both ways for one local connection at a time; Ctrl+C ends with 0', async () => {
+test('run tunnel: a ticket with the API token, the WebSocket on the console host, then each local connection as a connection of its own; Ctrl+C ends with 0', async () => {
   const { fake, sockets, port, exit, interrupt } = await tunnelSetup();
   await until(() => sockets.length === 1, 'the WebSocket');
   const { url, ws } = sockets[0];
@@ -646,40 +654,52 @@ test('run tunnel: a ticket with the API token, the WebSocket on the console host
 
   ws.open();
   assertStringIncludes(fake.printed[0], `tunnel to preview feature/x of acme/shop on 127.0.0.1:${port}`);
+  // Another port than 9229: Chrome has to be told (on 9229 it looks by itself).
+  assertStringIncludes(fake.printed[1], `Chrome: chrome://inspect, Configure… with localhost:${port}, then inspect under your app`);
   assert(!fake.printed.join('\n').includes('ticket=t'), 'the ticket is never printed');
 
-  const first = connectLocal(port);
-  await until(() => ws.controls().length === 1, 'connect');
-  assertEquals(ws.controls(), ['connect']);
-  first.socket.write('GET /json/list');
-  ws.receive('{"type":"connected"}');
-  await until(() => ws.bytes() === 'GET /json/list', 'the bytes held until connected');
-  ws.receive(new TextEncoder().encode('[{"id":"1"}]'));
-  await until(() => first.text() === '[{"id":"1"}]', 'the answer');
+  // DevTools' session, and chrome://inspect polling the target list next to it: two connections at once.
+  const session = connectLocal(port);
+  await until(() => ws.controls().length === 1, 'open 1');
+  session.socket.write('GET /ws');
+  ws.receive('{"type":"opened","id":1}');
+  await until(() => ws.bytes(1) === 'GET /ws', 'the bytes held until opened');
 
-  // The inspector closes the connection: the local one ends too.
-  ws.receive('{"type":"disconnected"}');
-  await until(first.ended, 'the local connection to end');
+  const poll = connectLocal(port);
+  await until(() => ws.controls().length === 2, 'open 2');
+  assertEquals(ws.controls(), ['open 1', 'open 2']);
+  ws.receive('{"type":"opened","id":2}');
+  poll.socket.write('GET /json/list');
+  await until(() => ws.bytes(2) === 'GET /json/list', "the poll's bytes");
+  ws.receiveFor(2, '[{"id":"1"}]');
+  ws.receiveFor(1, 'HTTP/1.1 101');
+  await until(() => poll.text() === '[{"id":"1"}]' && session.text() === 'HTTP/1.1 101', 'each answer to its own connection');
 
-  // The next connection asks again; a third one meanwhile replaces it.
-  const second = connectLocal(port);
-  await until(() => ws.controls().length === 2, 'the second connect');
-  ws.receive('{"type":"connected"}');
+  // The poll ends; the session goes on.
+  ws.receive('{"type":"closed","id":2}');
+  await until(poll.ended, 'the poll to end');
+  assert(!session.ended(), 'the session stays');
+  session.socket.write('more');
+  await until(() => ws.bytes(1) === 'GET /wsmore', 'the session still sends');
+
+  // A local connection that ends is closed at baua.
   const third = connectLocal(port);
-  await until(() => ws.controls().length === 4, 'disconnect and connect for the third');
-  await until(second.ended, 'the replaced connection to end');
-  assertEquals(ws.controls(), ['connect', 'connect', 'disconnect', 'connect']);
-  ws.receive(new TextEncoder().encode('stale'));
-  ws.receive('{"type":"disconnected"}');
-  ws.receive('{"type":"connected"}');
-  ws.receive(new TextEncoder().encode('fresh'));
-  await until(() => third.text() === 'fresh', "only the new connection's bytes");
+  await until(() => ws.controls().length === 3, 'open 3');
+  third.socket.end();
+  await until(() => ws.controls().includes('close 3'), 'close 3');
+
+  // A connection baua refuses ends locally, with the reason said.
+  const fourth = connectLocal(port);
+  await until(() => ws.controls().includes('open 4'), 'open 4');
+  ws.receive('{"type":"closed","id":4,"reason":"at most 8 connections per tunnel"}');
+  await until(fourth.ended, 'the refused connection to end');
+  assertEquals(fake.errors, ['warning: a connection to the inspector was refused: at most 8 connections per tunnel']);
 
   interrupt();
   assertEquals(await exit, 0);
   assertEquals(ws.closedWith, 1000);
   assertEquals(fake.printed.at(-1), '==> tunnel closed');
-  await until(third.ended, 'the local connection to close');
+  await until(session.ended, 'the local connection to close');
 });
 
 test('run tunnel: a refused ticket names the reason and opens no WebSocket; a tunnel URL on another host is refused', async () => {
@@ -724,4 +744,170 @@ test('run tunnel: a busy port fails before a ticket is asked for', async () => {
   } finally {
     await new Promise((resolve) => busy.close(resolve));
   }
+});
+
+const DEBUG_PATH = '/api/orgs/acme/projects/shop/previews/feature%2Fx/debug';
+const TICKET = json({ ticket: 't', url: 'wss://console.example/api/tunnel?ticket=t', expiresAt: '2026-11-10T10:00:00Z' }, 201);
+
+/** `baua debug` with a fake console (`routes` on top of the ticket) and WebSocket; `interrupt` is Ctrl+C. */
+async function debugSetup(routes: Record<string, Route | Route[]>, extra: string[] = [], cwd = '.', slow = false) {
+  const fake = fakeDeps({ [TICKET_PATH]: TICKET, ...routes });
+  if (slow) {
+    fake.deps.sleep = (ms) => new Promise((done) => setTimeout(done, Math.min(ms, 20)));
+  }
+
+  const sockets: FakeWebSocket[] = [];
+  let interrupt: (() => void) | undefined;
+  fake.deps.webSocket = () => {
+    const ws = new FakeWebSocket();
+    sockets.push(ws);
+
+    return ws as unknown as WebSocket;
+  };
+  fake.deps.onInterrupt = (handler) => {
+    interrupt = handler;
+
+    return () => {
+      interrupt = undefined;
+    };
+  };
+  fake.deps.cwd = () => cwd;
+  const port = await freePort();
+  const exit = run(['debug', '--project', 'acme/shop', '--preview', 'feature/x', '--port', String(port), ...extra], { BAUA_TOKEN: 'baua_x', BAUA_URL: BASE }, fake.deps);
+
+  return { fake, sockets, exit, interrupt: () => interrupt?.() };
+}
+
+test('parseCommand: debug takes the options of tunnel and --vscode, --keep', () => {
+  assertEquals(parseCommand(['debug', '--project', 'acme/shop', '--preview', 'pr-1']), { kind: 'debug', options: { project: { org: 'acme', name: 'shop' }, preview: 'pr-1', port: DEBUG_PORT, vscode: false, keep: false } });
+  assertEquals(parseCommand(['debug', '--project', 'acme/shop', '--preview', 'pr-1', '--vscode', '--keep', '--port', '9230']), { kind: 'debug', options: { project: { org: 'acme', name: 'shop' }, preview: 'pr-1', port: 9230, vscode: true, keep: true } });
+  assertStringIncludes((parseCommand(['debug', '--project', 'acme/shop']) as { message: string }).message, '--preview <name> is required for baua debug');
+  assertStringIncludes((parseCommand(['tunnel', '--project', 'acme/shop', '--preview', 'x', '--vscode']) as { message: string }).message, '--vscode is not an option of baua tunnel');
+});
+
+test('run debug: restarts the preview with the debugger, follows it until it runs, opens the tunnel; Ctrl+C ends debug mode again', async () => {
+  const { fake, sockets, exit, interrupt } = await debugSetup({
+    [`POST ${DEBUG_PATH}`]: json({ deployment: { id: 'd-1' } }, 202),
+    'GET /api/deployments/d-1': [json({ status: 'starting' }), json({ status: 'running' })],
+    'GET /api/deployments/d-1/logs': text('==> debug mode (Node.js): the inspector listens on 127.0.0.1:9229 inside the container\n'),
+    [`DELETE ${DEBUG_PATH}`]: json({ deployment: { id: 'd-2' } }, 202),
+  });
+  await until(() => sockets.length === 1, 'the WebSocket');
+  assertEquals(
+    fake.requests.map((r) => `${r.method} ${new URL(r.url).pathname}`).slice(0, 2),
+    [`POST ${DEBUG_PATH}`, 'GET /api/deployments/d-1'],
+  );
+  assertStringIncludes(fake.printed.join('\n'), 'restarting preview feature/x with the debugger');
+  assertStringIncludes(fake.printed.join('\n'), 'the inspector listens on 127.0.0.1:9229');
+  sockets[0].open();
+
+  interrupt();
+  assertEquals(await exit, 0);
+  assertEquals(fake.requests.at(-1)?.method, 'DELETE');
+  assertEquals(fake.printed.at(-1), '==> restarting preview feature/x without the debugger');
+});
+
+test('run debug: a preview in debug mode already is left in it; --keep leaves it too; a failed restart opens no tunnel', async () => {
+  const already = await debugSetup({ [`POST ${DEBUG_PATH}`]: json({ deployment: { id: 'd-1' } }, 200) });
+  await until(() => already.sockets.length === 1, 'the WebSocket');
+  assertStringIncludes(already.fake.printed[0], 'runs in debug mode already');
+  already.sockets[0].open();
+  already.interrupt();
+  assertEquals(await already.exit, 0);
+  assert(!already.fake.requests.some((r) => r.method === 'DELETE'), 'not ended: it was on before');
+
+  const keep = await debugSetup({ [`POST ${DEBUG_PATH}`]: json({ deployment: { id: 'd-1' } }, 202), 'GET /api/deployments/d-1': json({ status: 'running' }), 'GET /api/deployments/d-1/logs': text('') }, ['--keep']);
+  await until(() => keep.sockets.length === 1, 'the WebSocket');
+  keep.sockets[0].open();
+  keep.interrupt();
+  assertEquals(await keep.exit, 0);
+  assert(!keep.fake.requests.some((r) => r.method === 'DELETE'), '--keep');
+
+  const failed = await debugSetup({
+    [`POST ${DEBUG_PATH}`]: json({ deployment: { id: 'd-1' } }, 202),
+    'GET /api/deployments/d-1': json({ status: 'failed', error: 'app did not respond' }),
+    'GET /api/deployments/d-1/logs': text(''),
+    [`DELETE ${DEBUG_PATH}`]: json({ deployment: { id: 'd-2' } }, 202),
+  });
+  assertEquals(await failed.exit, 1);
+  assertEquals(failed.fake.errors, ['error: the restart with the debugger ended failed: app did not respond']);
+  assertEquals(failed.sockets, []);
+
+  const refused = await debugSetup({ [`POST ${DEBUG_PATH}`]: json({ error: 'the debugger tunnel is off for this project' }, 403) });
+  assertEquals(await refused.exit, 1);
+  assertEquals(refused.fake.errors, ['error: debug mode refused: 403: the debugger tunnel is off for this project']);
+});
+
+test('run debug --vscode: adds the attach configuration to .vscode/launch.json, keeps the others, replaces its own; a file with comments is left alone', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'baua-cli-vscode-'));
+  try {
+    const routes = { [`POST ${DEBUG_PATH}`]: json({ deployment: { id: 'd-1' } }, 200) };
+    const first = await debugSetup(routes, ['--vscode'], dir);
+    await until(() => first.sockets.length === 1, 'the WebSocket');
+    first.sockets[0].open();
+    first.interrupt();
+    await first.exit;
+    const written = JSON.parse(await readFile(join(dir, '.vscode', 'launch.json'), 'utf8'));
+    assertEquals(written.configurations.length, 1);
+    assertEquals(written.configurations[0].name, 'baua: feature/x');
+    assertEquals([written.configurations[0].request, written.configurations[0].remoteRoot, written.configurations[0].address], ['attach', '/app', '127.0.0.1']);
+
+    // Another configuration stays; its own is replaced, not added twice.
+    written.configurations.push({ name: 'mine', type: 'node', request: 'launch' });
+    await writeFile(join(dir, '.vscode', 'launch.json'), JSON.stringify(written));
+    const second = await debugSetup(routes, ['--vscode'], dir);
+    await until(() => second.sockets.length === 1, 'the WebSocket');
+    second.sockets[0].open();
+    second.interrupt();
+    await second.exit;
+    const names = JSON.parse(await readFile(join(dir, '.vscode', 'launch.json'), 'utf8')).configurations.map((c: { name: string }) => c.name);
+    assertEquals(names, ['mine', 'baua: feature/x']);
+
+    // VS Code's own file has comments: the configuration is inserted as text, the comments stay.
+    const commented = '// mine\n{ "configurations": [] }';
+    await writeFile(join(dir, '.vscode', 'launch.json'), commented);
+    const third = await debugSetup(routes, ['--vscode'], dir);
+    await until(() => third.sockets.length === 1, 'the WebSocket');
+    third.sockets[0].open();
+    third.interrupt();
+    await third.exit;
+    const inserted = await readFile(join(dir, '.vscode', 'launch.json'), 'utf8');
+    assert(inserted.startsWith('// mine\n'));
+    assertEquals(JSON.parse(inserted.slice('// mine\n'.length)).configurations.map((c: { name: string }) => c.name), ['baua: feature/x']);
+    assertStringIncludes(third.fake.printed.join('\n'), 'start it with F5');
+    assertEquals(launchConfig({ project: { org: 'a', name: 'b' }, preview: 'x', port: 9230 }).port, 9230);
+
+    // launchText: a commented file with its configuration already in it stays; one without "configurations" is left to the user.
+    const config = launchConfig({ project: { org: 'a', name: 'b' }, preview: 'x', port: 9229 });
+    const withOther = '// c\n{ "configurations": [ { "name": "mine" } ] }';
+    const next = launchText(withOther, config)!;
+    assertEquals(JSON.parse(next.slice('// c\n'.length)).configurations.map((c: { name: string }) => c.name), ['baua: x', 'mine']);
+    assertEquals(launchText(next, config), next);
+    assertEquals(launchText('// c\n{}', config), null);
+    assertEquals(launchText('null', config), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: without BAUA_TOKEN, deploy asks for a deploy or API token, the other commands for an API token', async () => {
+  const fake = fakeDeps({});
+  assertEquals(await run(['debug', '--project', 'acme/shop', '--preview', 'x'], {}, fake.deps), 1);
+  assertEquals(await run(['deploy', 'out', '--runtime', 'node@24'], {}, fake.deps), 1);
+  assertEquals(fake.errors, ['error: BAUA_TOKEN is not set (an API token (baua_…) from Account → API tokens)', 'error: BAUA_TOKEN is not set (a deploy token from the project settings, or an API token)']);
+});
+
+test('run debug: Ctrl+C during the restart ends debug mode too, and opens no tunnel', async () => {
+  const { fake, sockets, exit, interrupt } = await debugSetup({
+    [`POST ${DEBUG_PATH}`]: json({ deployment: { id: 'd-1' } }, 202),
+    'GET /api/deployments/d-1': json({ status: 'starting' }),
+    'GET /api/deployments/d-1/logs': text(''),
+    [`DELETE ${DEBUG_PATH}`]: json({ deployment: { id: 'd-2' } }, 202),
+  }, [], '.', true);
+  await until(() => fake.requests.some((r) => r.url.endsWith('/api/deployments/d-1')), 'the follow');
+  interrupt();
+  assertEquals(await exit, 1);
+  assertEquals(fake.errors, ['error: interrupted']);
+  assertEquals(fake.requests.at(-1)?.method, 'DELETE');
+  assertEquals(sockets, []);
 });
