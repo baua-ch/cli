@@ -2,8 +2,8 @@
 /**
  * The baua CLI: `baua deploy <dir> --runtime <runtime>` uploads a directory that CI has built and follows the deployment until it runs (https://console.baua.ch/docs/deploy-from-ci);
  * `baua logs` prints an app's log lines and `baua errors` the exceptions it reported through OpenTelemetry; `baua env pull` writes an app's
- * environment variables to a .env file and `baua run` starts a local command with them; `baua tunnel` connects a local debugger to a
- * preview in debug mode (https://console.baua.ch/docs/cli).
+ * environment variables to a .env file and `baua run` starts a local command with them; `baua debug` restarts a preview with the
+ * debugger and connects a local debugger to it, `baua tunnel` only connects (https://console.baua.ch/docs/cli).
  * Runs on Node.js 24 and Deno 2 without dependencies; packs with the system `tar`.
  *
  * @module
@@ -11,7 +11,7 @@
 import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
 import { constants } from 'node:os';
 import { join, relative } from 'node:path';
@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 /** Kept equal to jsr.json's version (a unit test checks it). */
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 
 export const DEFAULT_URL = 'https://console.baua.ch';
 
@@ -60,12 +60,16 @@ const TUNNEL_WARN_MS = 5 * 60_000;
 /** baua's reasons for closing a tunnel that are no failure: exit code 0. */
 const QUIET_ENDS = ['idle', 'time limit'];
 
+/** A binary message of the tunnel starts with its connection's id (protocol 2, https://console.baua.ch/docs/debugging). */
+export const FRAME_HEADER_BYTES = 4;
+
 const USAGE = `Usage:
   baua deploy <dir> --runtime <runtime> [--start <command>] [--preview <name>] [--project <org>/<name>]
   baua logs --project <org>/<name> [--preview <name>] [--since <time>] [--follow]
   baua errors --project <org>/<name> [--preview <name>] [--since <time>] [--stack]
   baua env pull [<file>] --project <org>/<name> [--preview <name>] [--force]
   baua run --project <org>/<name> [--preview <name>] -- <command> [<args>…]
+  baua debug --project <org>/<name> --preview <name> [--port <port>] [--vscode] [--keep]
   baua tunnel --project <org>/<name> --preview <name> [--port <port>]
 
   deploy   uploads the built app in <dir> to baua and follows the deployment until it runs
@@ -73,7 +77,9 @@ const USAGE = `Usage:
   errors   lists the exceptions the app reported through OpenTelemetry, grouped by type and message
   env pull writes the app's environment variables to <file> (default .env); --force overwrites it
   run      starts <command> on this machine with the app's environment variables, without writing them to disk
-  tunnel   connects a debugger on this machine to a preview in debug mode, on 127.0.0.1:<port>
+  debug    restarts a preview with the debugger (if it is not in debug mode yet) and connects a debugger on this machine to it, on
+           127.0.0.1:<port>; Ctrl+C closes the tunnel and restarts the preview without the debugger
+  tunnel   only connects a debugger on this machine to a preview already in debug mode, on 127.0.0.1:<port>
 
 Options:
   --runtime <runtime>   deploy: ${RUNTIMES.join(', ')}
@@ -84,12 +90,14 @@ Options:
   -f, --follow          logs: keep printing new lines until Ctrl+C
   --stack               errors: print the newest stack trace of each group
   --force               env pull: overwrite an existing file
-  --port <port>         tunnel: the local port, default ${DEBUG_PORT}
+  --port <port>         debug, tunnel: the local port, default ${DEBUG_PORT}
+  --vscode              debug: adds an "attach" configuration for the preview to .vscode/launch.json in this directory
+  --keep                debug: the preview stays in debug mode after Ctrl+C
   -h, --help            show this help
   -v, --version         show the version
 
 Environment:
-  BAUA_TOKEN            required: a deploy token (bdt_…, deploy only) or an API token (baua_…)
+  BAUA_TOKEN            required: an API token (baua_…, Account → API tokens); for deploy also a deploy token (bdt_…)
   BAUA_URL              the console, default ${DEFAULT_URL}`;
 
 export interface DeployOptions {
@@ -121,6 +129,14 @@ export interface TunnelOptions {
   port: number;
 }
 
+/** `baua debug`: a tunnel, and debug mode around it. */
+export interface DebugOptions extends TunnelOptions {
+  /** Adds an attach configuration to .vscode/launch.json. */
+  vscode: boolean;
+  /** Leaves debug mode on after the tunnel. */
+  keep: boolean;
+}
+
 export type Command =
   | { kind: 'help' }
   | { kind: 'version' }
@@ -129,6 +145,7 @@ export type Command =
   | { kind: 'env'; options: EnvOptions & { file: string; force: boolean } }
   | { kind: 'run'; options: EnvOptions & { command: string[] } }
   | { kind: 'tunnel'; options: TunnelOptions }
+  | { kind: 'debug'; options: DebugOptions }
   | { kind: 'error'; message: string };
 
 export interface Deps {
@@ -142,6 +159,8 @@ export interface Deps {
   webSocket: (url: string) => WebSocket;
   /** Calls the handler on Ctrl+C; returns the function that stops it. */
   onInterrupt: (handler: () => void) => () => void;
+  /** The directory `--vscode` writes .vscode/launch.json in. */
+  cwd: () => string;
 }
 
 export interface Packed {
@@ -158,7 +177,7 @@ class UnreachableError extends CliError {}
 const UNAVAILABLE = [502, 503, 504];
 
 /** The options only some commands take. */
-const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'], force: ['env'], port: ['tunnel'] };
+const ONLY: Record<string, string[]> = { runtime: ['deploy'], start: ['deploy'], since: ['logs', 'errors'], follow: ['logs'], stack: ['errors'], force: ['env'], port: ['tunnel', 'debug'], vscode: ['debug'], keep: ['debug'] };
 
 /** Parses and checks the arguments locally, before anything is packed or sent. */
 export function parseCommand(args: string[]): Command {
@@ -178,6 +197,8 @@ export function parseCommand(args: string[]): Command {
         stack: { type: 'boolean' },
         force: { type: 'boolean' },
         port: { type: 'string' },
+        vscode: { type: 'boolean' },
+        keep: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -206,9 +227,9 @@ export function parseCommand(args: string[]): Command {
   const read = (command === 'logs' || command === 'errors') && positionals.length === 1;
   const pull = command === 'env' && positionals[1] === 'pull' && positionals.length <= 3;
   const runs = command === 'run';
-  const tunnel = command === 'tunnel' && positionals.length === 1;
+  const tunnel = (command === 'tunnel' || command === 'debug') && positionals.length === 1;
   if (!read && !pull && !runs && !tunnel && !(command === 'deploy' && positionals.length === 2)) {
-    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs, baua errors, baua env pull, baua run -- <command> or baua tunnel (see --help)' };
+    return { kind: 'error', message: 'expected: baua deploy <dir> --runtime <runtime>, baua logs, baua errors, baua env pull, baua run -- <command>, baua debug or baua tunnel (see --help)' };
   }
 
   const wrong = Object.keys(ONLY).find((name) => values[name as keyof typeof values] !== undefined && !ONLY[name].includes(command));
@@ -242,9 +263,9 @@ export function parseCommand(args: string[]): Command {
     return { kind: 'run', options: { project, preview: values.preview, command: runCommand } };
   }
 
-  if (command === 'tunnel' && project) {
+  if ((command === 'tunnel' || command === 'debug') && project) {
     if (values.preview === undefined) {
-      return { kind: 'error', message: '--preview <name> is required for baua tunnel: only previews run with a debugger' };
+      return { kind: 'error', message: `--preview <name> is required for baua ${command}: only previews run with a debugger` };
     }
 
     const port = Number(values.port ?? DEBUG_PORT);
@@ -252,7 +273,9 @@ export function parseCommand(args: string[]): Command {
       return { kind: 'error', message: '--port must be a port number from 1 to 65535' };
     }
 
-    return { kind: 'tunnel', options: { project, preview: values.preview, port } };
+    const options = { project, preview: values.preview, port };
+
+    return command === 'debug' ? { kind: 'debug', options: { ...options, vscode: values.vscode === true, keep: values.keep === true } } : { kind: 'tunnel', options };
   }
 
   if ((command === 'logs' || command === 'errors') && project) {
@@ -468,7 +491,8 @@ export async function run(args: string[], env: Record<string, string | undefined
 
   const token = env.BAUA_TOKEN?.trim();
   if (!token) {
-    deps.error('error: BAUA_TOKEN is not set (a deploy token from the project settings, or an API token)');
+    const which = command.kind === 'deploy' ? 'a deploy token from the project settings, or an API token' : 'an API token (baua_…) from Account → API tokens';
+    deps.error(`error: BAUA_TOKEN is not set (${which})`);
 
     return 1;
   }
@@ -493,6 +517,10 @@ export async function run(args: string[], env: Record<string, string | undefined
 
     if (command.kind === 'tunnel') {
       return await openTunnel(deps, base, token, command.options);
+    }
+
+    if (command.kind === 'debug') {
+      return await debugPreview(deps, base, token, command.options);
     }
 
     return command.kind === 'logs' ? await printLogs(deps, base, token, command.options) : await printErrors(deps, base, token, command.options);
@@ -804,63 +832,241 @@ async function openTunnel(deps: Deps, base: string, token: string, options: Tunn
   }
 }
 
+/**
+ * `baua debug`: debug mode on (a restart with the same image, followed until it runs) unless it is on already, then the tunnel; after
+ * the tunnel – Ctrl+C, or baua closed it – the preview is restarted without the debugger again, unless it was in debug mode before or
+ * --keep. Listens first, so a busy port fails before anything restarts.
+ */
+async function debugPreview(deps: Deps, base: string, token: string, options: DebugOptions): Promise<number> {
+  const server = await listen(options.port);
+  // Until the tunnel forwards, a debugger that knocks early is turned away (it tries again) instead of waiting forever.
+  const early = (socket: Socket) => socket.destroy();
+  server.on('connection', early);
+  const debugUrl = `${projectApi(base, options.project)}/previews/${encodeURIComponent(options.preview)}/debug`;
+  let started = false;
+  // Ctrl+C before the tunnel forwards still ends debug mode (the finally below); forward() then has its own handler.
+  let stopEarly = () => {};
+  const interrupted = new Promise<never>((_, fail) => {
+    stopEarly = deps.onInterrupt(() => fail(new CliError('interrupted')));
+  });
+  interrupted.catch(() => {});
+
+  try {
+    // Before debug mode: a launch.json that cannot be written has nothing to undo.
+    if (options.vscode) {
+      await addLaunchConfig(deps, options);
+    }
+
+    let res: Response;
+    try {
+      res = await Promise.race([deps.fetch(debugUrl, { method: 'POST', headers: { authorization: `Bearer ${token}` }, redirect: 'error' }), interrupted]);
+    } catch (error) {
+      if (error instanceof CliError) {
+        throw error;
+      }
+
+      throw new CliError(`cannot reach ${new URL(base).origin}: ${(error as Error).message}`);
+    }
+
+    if (res.status === 202) {
+      started = true;
+      const id = ((await res.json().catch(() => null)) as { deployment?: { id?: string } } | null)?.deployment?.id;
+      if (typeof id !== 'string') {
+        throw new CliError('debug mode: the console answered without the deployment');
+      }
+
+      deps.print(`==> restarting preview ${options.preview} with the debugger`);
+      const result = await Promise.race([follow(deps, base, token, id), interrupted]);
+      if (result.status !== 'running') {
+        throw new CliError(`the restart with the debugger ended ${result.status}${result.error ? `: ${result.error}` : ''}`);
+      }
+    } else if (res.status === 200) {
+      await res.body?.cancel();
+      deps.print(`==> preview ${options.preview} runs in debug mode already`);
+    } else {
+      throw new CliError(`debug mode refused: ${await serverMessage(res)}`);
+    }
+
+    const url = await Promise.race([tunnelUrl(deps, base, token, options), interrupted]);
+    stopEarly();
+    server.off('connection', early);
+
+    return await forward(deps, deps.webSocket(url), server, attachHelp(base, options));
+  } finally {
+    stopEarly();
+    server.close();
+    if (started && !options.keep) {
+      // A second Ctrl+C must not cut the restart without the debugger.
+      const ignore = deps.onInterrupt(() => {});
+      await endDebugMode(deps, debugUrl, token, options);
+      ignore();
+    }
+  }
+}
+
+/** "Restart without debugger"; a failure is said, not thrown: the tunnel's own result stays the exit code. */
+async function endDebugMode(deps: Deps, debugUrl: string, token: string, options: DebugOptions): Promise<void> {
+  try {
+    const res = await deps.fetch(debugUrl, { method: 'DELETE', headers: { authorization: `Bearer ${token}` }, redirect: 'error' });
+    if (res.status === 202) {
+      await res.body?.cancel();
+      deps.print(`==> restarting preview ${options.preview} without the debugger`);
+
+      return;
+    }
+
+    deps.error(`warning: preview ${options.preview} stays in debug mode: ${await serverMessage(res)}; it ends with the next deployment or after 24 hours`);
+  } catch (error) {
+    deps.error(`warning: preview ${options.preview} stays in debug mode: ${(error as Error).message}; it ends with the next deployment or after 24 hours`);
+  }
+}
+
+/** The attach configuration of VS Code for a preview: the inspector through the tunnel, the app's files under /app in the container. */
+export function launchConfig(options: TunnelOptions): Record<string, unknown> {
+  return { type: 'node', request: 'attach', name: `baua: ${options.preview}`, address: '127.0.0.1', port: options.port, localRoot: '${workspaceFolder}', remoteRoot: '/app' };
+}
+
+/**
+ * --vscode: .vscode/launch.json gets the preview's configuration (one of the same name is replaced). A file with comments (VS Code's own
+ * starts with one) gets it inserted as text, so the comments stay; one it cannot read or write, the CLI prints the configuration instead.
+ */
+async function addLaunchConfig(deps: Deps, options: TunnelOptions): Promise<void> {
+  const dir = join(deps.cwd(), '.vscode');
+  const file = join(dir, 'launch.json');
+  const config = launchConfig(options);
+  const yourself = (why: string) => {
+    deps.print(`==> ${file} ${why}; add this configuration yourself:`);
+    deps.print(JSON.stringify(config, null, 2));
+  };
+
+  try {
+    let text: string | null = null;
+    try {
+      text = await readFile(file, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
+    }
+
+    const next = launchText(text, config);
+    if (next === null) {
+      yourself('is no launch configuration the CLI understands');
+
+      return;
+    }
+
+    if (next !== text) {
+      await mkdir(dir, { recursive: true });
+      await writeFile(file, next);
+    }
+
+    deps.print(`==> VS Code: "${config.name}" in .vscode/launch.json – start it with F5 (Run and Debug)`);
+  } catch (error) {
+    yourself(`cannot be written (${(error as Error).message})`);
+  }
+}
+
+/**
+ * The text of launch.json with `config` in it, or null when it cannot tell where. Plain JSON is parsed (a configuration of the same name
+ * is replaced); JSON with comments gets the configuration inserted after `"configurations": [`, unless one of its name is there already.
+ */
+export function launchText(text: string | null, config: Record<string, unknown>): string | null {
+  if (text === null) {
+    return `${JSON.stringify({ version: '0.2.0', configurations: [config] }, null, 2)}\n`;
+  }
+
+  let launch: unknown;
+  try {
+    launch = JSON.parse(text);
+  } catch {
+    if (text.includes(JSON.stringify(config.name))) {
+      return text;
+    }
+
+    const start = /"configurations"\s*:\s*\[/.exec(text);
+    if (!start) {
+      return null;
+    }
+
+    const at = start.index + start[0].length;
+    const empty = /^\s*\]/.test(text.slice(at));
+    const entry = JSON.stringify(config, null, 2).replace(/\n/g, '\n    ');
+
+    return `${text.slice(0, at)}\n    ${entry}${empty ? '' : ','}${text.slice(at)}`;
+  }
+
+  if (typeof launch !== 'object' || launch === null || Array.isArray(launch)) {
+    return null;
+  }
+
+  const current = launch as { version?: string; configurations?: unknown };
+  const others = (Array.isArray(current.configurations) ? current.configurations : []).filter((c) => (c as { name?: unknown } | null)?.name !== config.name);
+
+  return `${JSON.stringify({ ...current, version: current.version ?? '0.2.0', configurations: [...others, config] }, null, 2)}\n`;
+}
+
 function attachHelp(base: string, options: TunnelOptions): string[] {
   const until = new Date(Date.now() + TUNNEL_MAX_MS).toTimeString().slice(0, 5);
+  // Chrome looks at localhost:9229 by itself; another port it has to be told.
+  const chrome = options.port === DEBUG_PORT ? 'chrome://inspect, then inspect under your app' : `chrome://inspect, Configure… with localhost:${options.port}, then inspect under your app`;
 
   return [
     `==> tunnel to preview ${options.preview} of ${options.project.org}/${options.project.name} on 127.0.0.1:${options.port}, until ${until} at the latest`,
-    `    Chrome: chrome://inspect, Configure… with localhost:${options.port}, then inspect under your app`,
-    `    VS Code: an "attach" configuration with "address": "127.0.0.1", "port": ${options.port}, "remoteRoot": "/app" (${base}/docs/debugging)`,
+    `    Chrome: ${chrome}`,
+    `    VS Code: --vscode adds an "attach" configuration, or see ${base}/docs/debugging`,
     '    It closes after 15 minutes without traffic, after 60 minutes, or with Ctrl+C.',
   ];
 }
 
+/** The binary message of connection `id`: its id in 4 bytes, then the bytes. */
+export function frame(id: number, bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(FRAME_HEADER_BYTES + bytes.byteLength);
+  new DataView(out.buffer).setUint32(0, id);
+  out.set(bytes, FRAME_HEADER_BYTES);
+
+  return out;
+}
+
 /**
- * Forwards one local connection at a time over the tunnel's WebSocket: `{"type":"connect"}` opens a connection to the inspector,
- * `connected` confirms it, binary messages are its bytes, `disconnect` and `disconnected` end it. A new local connection replaces the
- * current one, as a debugger opens one after the other (DevTools: the target list, then its WebSocket).
+ * Forwards every local connection over the tunnel's WebSocket, each as a connection of its own (protocol 2): `{"type":"open","id":n}`
+ * asks baua for a connection to the inspector, `opened` confirms it, `close` and `closed` end it; a binary message is the id in 4 bytes,
+ * then the bytes. A debugger opens several at once (DevTools: its session, and chrome://inspect polling the target list next to it).
  */
 export function forward(deps: Deps, ws: WebSocket, server: Server, help: string[]): Promise<number> {
   return new Promise((resolve) => {
     ws.binaryType = 'arraybuffer';
     let opened = false;
     let interrupted = false;
-    let current: Socket | null = null;
-    // `connecting`: a connect is on its way; the inspector connection it brings goes to whichever local connection is current then.
-    let state: 'idle' | 'connecting' | 'connected' = 'idle';
-    const send = (type: string) => ws.send(JSON.stringify({ type }));
-    const request = () => {
-      if (state === 'connected') {
-        send('disconnect');
-      }
-
-      send('connect');
-      state = 'connecting';
-    };
+    let nextId = 1;
+    /**
+     * The local connections by id; `open` once baua confirmed it. Until then its bytes wait in `pending` – the socket is read at once, so
+     * a connection the debugger drops before that is noticed (a paused socket would not tell).
+     */
+    const connections = new Map<number, { socket: Socket; open: boolean; pending: Buffer[] }>();
+    const send = (message: { type: string; id: number }) => ws.send(JSON.stringify(message));
 
     server.on('connection', (socket: Socket) => {
+      const id = nextId++;
+      const connection = { socket, open: false, pending: [] as Buffer[] };
+      connections.set(id, connection);
       socket.on('error', () => socket.destroy());
-      current?.destroy();
-      current = socket;
       socket.on('data', (chunk: Buffer) => {
-        if (socket === current && state === 'connected') {
-          ws.send(chunk);
+        if (connection.open) {
+          ws.send(frame(id, chunk));
+        } else {
+          connection.pending.push(chunk);
         }
       });
+      socket.resume();
       socket.on('close', () => {
-        if (socket !== current) {
-          return;
-        }
-
-        current = null;
-        if (state === 'connected') {
-          send('disconnect');
-          state = 'idle';
+        if (connections.delete(id) && opened) {
+          send({ type: 'close', id });
         }
       });
 
-      if (opened && state !== 'connecting') {
-        request();
+      if (opened) {
+        send({ type: 'open', id });
       }
     });
 
@@ -870,35 +1076,45 @@ export function forward(deps: Deps, ws: WebSocket, server: Server, help: string[
         deps.print(line);
       }
 
-      if (current) {
-        request();
+      for (const id of connections.keys()) {
+        send({ type: 'open', id });
       }
     });
 
     ws.addEventListener('message', (event: MessageEvent) => {
       if (typeof event.data !== 'string') {
-        if (state === 'connected') {
-          current?.write(new Uint8Array(event.data as ArrayBuffer));
+        const data = new Uint8Array(event.data as ArrayBuffer);
+        if (data.byteLength < FRAME_HEADER_BYTES) {
+          return;
+        }
+
+        const connection = connections.get(new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0));
+        if (connection?.open) {
+          connection.socket.write(data.subarray(FRAME_HEADER_BYTES));
         }
 
         return;
       }
 
-      const type = controlType(event.data);
-      if (type === 'connected' && state === 'connecting') {
-        if (current) {
-          state = 'connected';
-          current.resume();
-        } else {
-          send('disconnect');
-          state = 'idle';
+      const message = controlMessage(event.data);
+      const connection = message?.id === undefined ? undefined : connections.get(message.id);
+      if (!message || !connection) {
+        return;
+      }
+
+      if (message.type === 'opened') {
+        connection.open = true;
+        for (const chunk of connection.pending.splice(0)) {
+          ws.send(frame(message.id as number, chunk));
         }
-      } else if (type === 'disconnected' && state === 'connected') {
-        // The inspector closed the connection.
-        state = 'idle';
-        const socket = current;
-        current = null;
-        socket?.end();
+      } else if (message.type === 'closed') {
+        // The inspector closed it, or baua could not open it.
+        connections.delete(message.id as number);
+        if (message.reason) {
+          deps.error(`warning: a connection to the inspector was refused: ${clean(message.reason)}`);
+        }
+
+        connection.socket.end();
       }
     });
 
@@ -911,8 +1127,11 @@ export function forward(deps: Deps, ws: WebSocket, server: Server, help: string[
     ws.addEventListener('close', (event: CloseEvent) => {
       clearTimeout(warning);
       stop();
-      current?.destroy();
-      current = null;
+      for (const { socket } of connections.values()) {
+        socket.destroy();
+      }
+
+      connections.clear();
       if (interrupted) {
         deps.print('==> tunnel closed');
         resolve(0);
@@ -941,11 +1160,15 @@ export function forward(deps: Deps, ws: WebSocket, server: Server, help: string[
   });
 }
 
-function controlType(text: string): string | undefined {
+/** A control message of the tunnel: its type, the connection's id and baua's reason, if any. */
+function controlMessage(text: string): { type: string; id?: number; reason?: string } | undefined {
   try {
-    const message = JSON.parse(text) as { type?: unknown };
+    const message = JSON.parse(text) as { type?: unknown; id?: unknown; reason?: unknown };
+    if (typeof message.type !== 'string') {
+      return undefined;
+    }
 
-    return typeof message.type === 'string' ? message.type : undefined;
+    return { type: message.type, id: typeof message.id === 'number' ? message.id : undefined, reason: typeof message.reason === 'string' ? message.reason : undefined };
   } catch {
     return undefined;
   }
@@ -1057,6 +1280,7 @@ if (import.meta.main ?? (process.argv[1] !== undefined && realpathSync(process.a
 
       return () => process.off('SIGINT', handler);
     },
+    cwd: () => process.cwd(),
   };
 
   // Not process.exit: output to a pipe may still be pending.
